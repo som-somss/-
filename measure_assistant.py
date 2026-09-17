@@ -566,71 +566,84 @@ class BridgeMeasureApp(tk.Tk):
         return kept
 
     def infer_grid_and_assign(self, candidates):
-        h, w = self.working_cv.shape[:2]
+        """
+        지정한 실측영역을 정확히 5개 측량점 열 × N개 줄로 나눈 뒤,
+        각 OCR 숫자를 '가장 가까운 칸'에만 넣는다.
+
+        중요:
+        이전 버전처럼 OCR 숫자의 X좌표를 다시 군집화해서 측량점 열을 만들지 않는다.
+        숫자가 일부 누락되면 측량점1 숫자가 측량점2 열의 중심으로 오인되는 문제가 있었기 때문이다.
+        """
         if not self.roi:
             raise RuntimeError("실측영역이 지정되지 않았습니다.")
+
         x1, y1, x2, y2 = self.roi
-        rw, rh = x2-x1, y2-y1
+        rw, rh = x2 - x1, y2 - y1
 
-        # OCR 후보는 이미 ROI crop에서 나온 값이지만, 안전하게 영역 내부만 다시 사용
-        core = [x for x in candidates if x1 <= x["x"] <= x2 and y1 <= x["y"] <= y2]
+        # 사용자가 지정한 영역 자체를 5열 × N행으로 고정 분할한다.
+        # 따라서 OCR 누락 여부와 관계없이 측량점1~5의 경계가 절대로 서로 이동하지 않는다.
+        col_edges = [x1 + rw * i / COLS for i in range(COLS + 1)]
+        row_edges = [y1 + rh * i / self.rows for i in range(self.rows + 1)]
+        col_centers = [(col_edges[i] + col_edges[i+1]) / 2.0 for i in range(COLS)]
+        row_centers = [(row_edges[i] + row_edges[i+1]) / 2.0 for i in range(self.rows)]
 
-        heights = sorted(x["h"] for x in core)
-        med_h = heights[len(heights)//2] if heights else max(1.0, rh*0.025)
+        # 영역 내부 후보만 사용
+        core = [
+            it for it in candidates
+            if x1 <= it["x"] <= x2 and y1 <= it["y"] <= y2
+        ]
 
-        # 큰 글씨(손글씨) 우선
-        prominent = [x for x in core if x["h"] >= med_h * 0.90]
-        if len(prominent) < max(6, self.rows):
-            prominent = core
-
-        # 열/행 중심은 OCR이 부족해도 ROI를 균등분할해서 안정적으로 유지
-        # 실제 손글씨 위치가 충분하면 OCR 군집 중심을 사용
-        xs = [x["x"] for x in prominent]
-        ys = [x["y"] for x in prominent]
-        col_centers = self.cluster_1d(xs, COLS) if len(xs) >= COLS else None
-        row_centers = self.cluster_1d(ys, self.rows) if len(ys) >= self.rows else None
-
-        if col_centers is None:
-            col_centers = [x1 + rw*(i+0.5)/COLS for i in range(COLS)]
-        if row_centers is None:
-            row_centers = [y1 + rh*(i+0.5)/self.rows for i in range(self.rows)]
-
-        cgap = rw / COLS
-        rgap = rh / self.rows
+        # 손글씨는 대체로 인쇄 치수보다 크므로 높이 기준은 보조 점수로만 사용한다.
+        heights = sorted(it["h"] for it in core if it["h"] > 0)
+        med_h = heights[len(heights)//2] if heights else max(1.0, rh / self.rows * 0.18)
 
         cells = [self.empty_cell() for _ in range(self.total)]
-        used = set()
+        best_scores = [-1e9] * self.total
 
-        for c in range(COLS):
-            for r in range(self.rows):
-                cx0, cy0 = col_centers[c], row_centers[r]
-                choices = []
-                for j, it in enumerate(core):
-                    if j in used:
-                        continue
-                    dx = abs(it["x"]-cx0) / max(1.0, cgap)
-                    dy = abs(it["y"]-cy0) / max(1.0, rgap)
-                    # 한 칸 중심 주변만 허용: 외곽/옆 칸 숫자 유입 감소
-                    if dx <= 0.46 and dy <= 0.46:
-                        size_score = min(2.0, it["h"] / max(1.0, med_h))
-                        pos_score = max(0.0, 1.0 - 0.9*dx*dx - 1.2*dy*dy)
-                        score = 1.20*size_score + 0.55*it["confidence"] + 1.25*pos_score
-                        choices.append((score, j, it))
+        for it in core:
+            # 이 숫자가 실제로 어느 5열/N행 안에 들어있는지 먼저 확정한다.
+            c = int((it["x"] - x1) / max(1e-9, rw) * COLS)
+            r = int((it["y"] - y1) / max(1e-9, rh) * self.rows)
+            c = max(0, min(COLS - 1, c))
+            r = max(0, min(self.rows - 1, r))
 
-                if choices:
-                    choices.sort(key=lambda z: z[0], reverse=True)
-                    score, j, best = choices[0]
-                    reliable = best["h"] >= med_h*0.75 and score >= 2.10
-                    if reliable:
-                        used.add(j)
-                        status = "자동 인식" if best["confidence"] >= 0.55 else "확인 필요"
-                        cells[c*self.rows+r] = {
-                            "value": str(best["value"]),
-                            "confidence": best["confidence"],
-                            "status": status,
-                            "box": best["box"],
-                            "source": best["raw"]
-                        }
+            left, right = col_edges[c], col_edges[c+1]
+            top, bottom = row_edges[r], row_edges[r+1]
+            cell_w = max(1.0, right - left)
+            cell_h = max(1.0, bottom - top)
+            cx0, cy0 = col_centers[c], row_centers[r]
+
+            # 칸 중심과의 거리. 칸 경계를 넘은 숫자는 다른 측량점으로 절대 이동하지 않는다.
+            dx = abs(it["x"] - cx0) / (cell_w / 2.0)
+            dy = abs(it["y"] - cy0) / (cell_h / 2.0)
+
+            # 경계에 너무 붙은 숫자는 인쇄 치수/옆 칸 숫자일 가능성이 높아 감점한다.
+            edge_margin_x = min(it["x"] - left, right - it["x"]) / cell_w
+            edge_margin_y = min(it["y"] - top, bottom - it["y"]) / cell_h
+
+            pos_score = max(0.0, 1.0 - 0.55 * dx * dx - 0.75 * dy * dy)
+            size_score = min(1.8, it["h"] / max(1.0, med_h))
+            conf_score = max(0.0, min(1.0, it["confidence"]))
+
+            edge_penalty = 0.0
+            if edge_margin_x < 0.06:
+                edge_penalty += 0.45
+            if edge_margin_y < 0.04:
+                edge_penalty += 0.25
+
+            score = 1.55 * pos_score + 0.95 * size_score + 0.55 * conf_score - edge_penalty
+
+            idx = c * self.rows + r
+            if score > best_scores[idx]:
+                best_scores[idx] = score
+                status = "자동 인식" if conf_score >= 0.55 and score >= 2.15 else "확인 필요"
+                cells[idx] = {
+                    "value": str(it["value"]),
+                    "confidence": it["confidence"],
+                    "status": status,
+                    "box": it["box"],
+                    "source": it["raw"]
+                }
 
         return cells, col_centers, row_centers
 
@@ -662,7 +675,7 @@ class BridgeMeasureApp(tk.Tk):
             done = sum(1 for x in self.cells if x["value"])
             messagebox.showinfo(
                 "OCR 완료",
-                f"5개 측량점 × 6줄 = 총 30칸 중 {done}칸에 숫자 후보를 배치했습니다.\n\n"
+                f"5개 측량점 × {self.rows}줄 = 총 {self.total}칸 중 {done}칸에 숫자 후보를 배치했습니다.\n\n"
                 "빈칸은 사진을 보고 직접 입력하세요.\n"
                 "자동 입력된 값도 반드시 원본과 대조하세요.\n\n"
                 "표의 칸을 클릭하면 사진의 해당 위치를 확대해서 볼 수 있습니다."
