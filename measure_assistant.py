@@ -33,6 +33,14 @@ except Exception:
     OCR_IMPORT_ERROR = traceback.format_exc()
 
 
+
+def clean_digits(value):
+    """OCR 결과에서 숫자 문자만 남긴다."""
+    if value is None:
+        return ""
+    return "".join(ch for ch in str(value) if ch.isdigit())
+
+
 COLS = 5
 DEFAULT_ROWS = 6
 # 일반적인 거더 간격 실측값 후보 범위. 범위 밖 숫자는 자동배치에서 제외하지만 직접입력은 가능.
