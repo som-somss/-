@@ -90,6 +90,14 @@ class BridgeMeasureApp(tk.Tk):
         self.measure_xs = []
         self.measure_pick_mode = False
 
+        # OCR 개별 칸 영역 확인/수동조정
+        self.show_cell_regions = False
+        self.custom_cell_rects = {}   # idx -> (x1,y1,x2,y2)
+        self.cell_adjust_mode = False
+        self.cell_adjust_index = None
+        self.cell_adjust_start = None
+        self.selected_cell_index = None
+
         self.create_ui()
         self.reset_grid()
 
@@ -121,6 +129,8 @@ class BridgeMeasureApp(tk.Tk):
 
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(toolbar, text="측량점 5개 지정", command=self.start_measure_points).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="OCR 영역 보기", command=self.toggle_cell_regions).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="선택칸 영역 조정", command=self.start_cell_adjustment).pack(side="left", padx=3)
         ttk.Button(toolbar, text="숫자 자동인식(OCR)", command=self.run_ocr).pack(side="left", padx=3)
         ttk.Button(toolbar, text="표 비우기", command=self.clear_values).pack(side="left", padx=3)
         ttk.Button(toolbar, text="CSV 저장", command=self.save_csv).pack(side="right", padx=3)
@@ -130,7 +140,7 @@ class BridgeMeasureApp(tk.Tk):
         ttk.Label(
             guide,
             text=("1) 사진 불러오기 → 2) 방향 확인/회전 → 3) 줄 수 설정 → 4) 실측영역 지정 → "
-                  "5) 측량점 5개 지정 → 6) OCR → 7) 표와 사진 대조/수정 → 8) CSV 저장 → 9) CADian에서 MEASUREAUTO 실행")
+                  "5) 측량점 5개 지정 → 6) OCR 영역 보기/필요시 조정 → 7) OCR → 8) 표와 사진 대조/수정 → 9) CSV 저장 → 10) CADian에서 MEASUREAUTO 실행")
         ).pack(anchor="w")
 
         self.status_var = tk.StringVar(value="실측사진을 불러오세요.  |  휠: 확대/축소  드래그: 이동  더블클릭: 전체보기")
@@ -365,6 +375,20 @@ class BridgeMeasureApp(tk.Tk):
                     self.image_canvas.create_line(X, Y1, X, Y2, fill="#00c8ff", width=2, dash=(5, 3))
                     self.image_canvas.create_text(X + 7, Y1 + 14, text=str(i), fill="#00c8ff", anchor="w", font=("Arial", 11, "bold"))
 
+            # 5 x N OCR 예상영역을 모두 표시 (노란색). 수동조정 영역도 같은 방식으로 표시
+            if getattr(self, "show_cell_regions", False) and self.roi and len(self.measure_xs)==5:
+                left = cx - w * scale / 2; top = cy - h * scale / 2
+                for cc in range(5):
+                    for rr in range(self.rows):
+                        rect=self.cell_crop_rect(cc,rr)
+                        if not rect: continue
+                        ax,ay,bx,by=rect
+                        X1=left+ax*scale; Y1=top+ay*scale; X2=left+bx*scale; Y2=top+by*scale
+                        idx2=cc*self.rows+rr
+                        color="#00ff66" if idx2 in self.custom_cell_rects else "#ffd400"
+                        width2=3 if idx2==self.selected_cell_index else 1
+                        self.image_canvas.create_rectangle(X1,Y1,X2,Y2,outline=color,width=width2)
+
             # OCR 박스 또는 추정 셀 위치 표시
             if selected_index is not None and 0 <= selected_index < self.total:
                 cell = self.cells[selected_index]
@@ -481,6 +505,10 @@ class BridgeMeasureApp(tk.Tk):
         return None
 
     def on_canvas_left_down(self, event):
+        if getattr(self, "cell_adjust_mode", False):
+            p=self.canvas_to_image(event.x,event.y)
+            if p: self.cell_adjust_start=p
+            return
         # 측량점 지정 모드에서는 일반 드래그보다 클릭 지정을 우선한다.
         if getattr(self, "measure_pick_mode", False):
             self._handle_measure_point_click(event)
@@ -499,6 +527,13 @@ class BridgeMeasureApp(tk.Tk):
             self.drag_start = (event.x, event.y, self.offset_x, self.offset_y)
 
     def on_canvas_left_drag(self, event):
+        if getattr(self,"cell_adjust_mode",False) and self.cell_adjust_start:
+            p=self.canvas_to_image(event.x,event.y)
+            if p:
+                x1,y1=self.cell_adjust_start; x2,y2=p
+                self.custom_cell_rects[self.cell_adjust_index]=(min(x1,x2),min(y1,y2),max(x1,x2),max(y1,y2))
+                self.redraw_image(self.cell_adjust_index)
+            return
         if self.roi_select_mode and self.roi_start_canvas:
             x0, y0 = self.roi_start_canvas
             if self.roi_temp_item:
@@ -536,6 +571,17 @@ class BridgeMeasureApp(tk.Tk):
             self.redraw_image()
 
     def on_canvas_left_up(self, event):
+        if getattr(self,"cell_adjust_mode",False) and self.cell_adjust_start:
+            p=self.canvas_to_image(event.x,event.y)
+            if p:
+                x1,y1=self.cell_adjust_start; x2,y2=p
+                if abs(x2-x1)>8 and abs(y2-y1)>8:
+                    self.custom_cell_rects[self.cell_adjust_index]=(min(x1,x2),min(y1,y2),max(x1,x2),max(y1,y2))
+            c=self.cell_adjust_index//self.rows; r=self.cell_adjust_index%self.rows
+            self.cell_adjust_mode=False; self.cell_adjust_start=None
+            self.status_var.set(f"측량점 {c+1} / {r+1}줄 OCR 영역 수동조정 완료. 필요하면 다른 표 칸도 조정하세요.")
+            self.redraw_image(self.cell_adjust_index)
+            return
         if self.roi_select_mode and self.roi_start_canvas:
             p1 = self.canvas_to_image(*self.roi_start_canvas)
             p2 = self.canvas_to_image(event.x, event.y)
@@ -922,6 +968,34 @@ class BridgeMeasureApp(tk.Tk):
 
         return cells, col_centers, row_centers
 
+    def toggle_cell_regions(self):
+        if not self.roi or len(self.measure_xs) != 5:
+            messagebox.showwarning("확인", "먼저 실측영역과 측량점 5개를 지정하세요.")
+            return
+        self.show_cell_regions = not self.show_cell_regions
+        self.status_var.set("OCR 인식영역 표시 ON - 표의 칸을 클릭하면 해당 영역을 확대합니다." if self.show_cell_regions else "OCR 인식영역 표시 OFF")
+        self.redraw_image(self.selected_cell_index)
+
+    def start_cell_adjustment(self):
+        if self.selected_cell_index is None:
+            messagebox.showwarning("선택칸 영역 조정", "오른쪽 표에서 먼저 조정할 칸을 한 번 클릭하세요.")
+            return
+        if not self.roi or len(self.measure_xs) != 5:
+            messagebox.showwarning("확인", "먼저 실측영역과 측량점 5개를 지정하세요.")
+            return
+        self.cell_adjust_mode = True
+        self.cell_adjust_index = self.selected_cell_index
+        self.cell_adjust_start = None
+        self.show_cell_regions = True
+        c=self.cell_adjust_index//self.rows; r=self.cell_adjust_index%self.rows
+        self.status_var.set(f"측량점 {c+1} / {r+1}줄 OCR 영역 조정: 사진에서 손글씨 4자리만 포함하도록 사각형을 드래그하세요.")
+        self.redraw_image(self.cell_adjust_index)
+
+    def reset_selected_cell_region(self):
+        if self.selected_cell_index is None: return
+        self.custom_cell_rects.pop(self.selected_cell_index, None)
+        self.redraw_image(self.selected_cell_index)
+
     def cell_crop_rect(self, c, r):
         """사용자가 찍은 측량점 X와 줄 번호로 '손글씨 한 칸'만 잘라낸다.
         핵심: 측량점 사이 전체 폭을 쓰지 않고 파란 기준선 주변의 좁은 영역만 사용한다.
@@ -929,6 +1003,9 @@ class BridgeMeasureApp(tk.Tk):
         """
         if not self.roi or len(self.measure_xs) != 5:
             return None
+        idx = c*self.rows+r
+        if idx in self.custom_cell_rects:
+            return self.custom_cell_rects[idx]
         x1, y1, x2, y2 = self.roi
         xs = sorted(self.measure_xs)
         rw, rh = x2-x1, y2-y1
@@ -939,15 +1016,15 @@ class BridgeMeasureApp(tk.Tk):
         gaps = [xs[i+1]-xs[i] for i in range(4) if xs[i+1] > xs[i]]
         gap = min(gaps) if gaps else rw/5.0
         # 전체 열 폭의 일부만 사용. 인접 측량점/인쇄 치수 침범 방지
-        win = min(gap*0.34, rw*0.075)
+        win = min(gap*0.46, rw*0.095)
         win = max(win, 42.0)
 
         # 손글씨는 파란 기준선의 왼쪽에 있는 경우가 많으므로 좌측 78%, 우측 22%
-        lx = xs[c] - win*0.78
-        rx = xs[c] + win*0.22
+        lx = xs[c] - win*0.88
+        rx = xs[c] + win*0.12
         # 행 경계의 인쇄선/치수선이 덜 들어오도록 높이도 축소
-        ty = cy - row_h*0.31
-        by = cy + row_h*0.31
+        ty = cy - row_h*0.34
+        by = cy + row_h*0.34
 
         return max(x1,lx), max(y1,ty), min(x2,rx), min(y2,by)
 
@@ -1123,6 +1200,7 @@ class BridgeMeasureApp(tk.Tk):
         if not info:
             return
         r, c, idx, _ = info
+        self.selected_cell_index = idx
         cell = self.cells[idx]
         conf = f"{cell['confidence']*100:.0f}%" if cell["confidence"] else "-"
         self.detail_var.set(f"측량점 {c+1} / {r+1}줄  |  값: {cell['value'] or '(빈칸)'}  |  인식률: {conf}  |  상태: {cell['status']}")
@@ -1138,6 +1216,13 @@ class BridgeMeasureApp(tk.Tk):
         elif cell.get("crop_rect"):
             x1,y1,x2,y2=cell["crop_rect"]
             tx,ty=(x1+x2)/2.0,(y1+y2)/2.0
+        elif self.roi and len(self.measure_xs)==5:
+            c, r = idx//self.rows, idx%self.rows
+            rect=self.cell_crop_rect(c,r)
+            if rect:
+                x1,y1,x2,y2=rect; tx,ty=(x1+x2)/2.0,(y1+y2)/2.0
+            else:
+                tx,ty=self.measure_xs[c], (self.roi[1]+self.roi[3])/2
         elif self.col_centers is not None and self.row_centers is not None:
             c, r = idx//self.rows, idx%self.rows
             tx, ty = self.col_centers[c], self.row_centers[r]
