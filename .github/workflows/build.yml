@@ -1,0 +1,38 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Download project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller easyocr
+
+      - name: Build EXE
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name "BridgeMeasure" --collect-all easyocr measure_assistant.py
+
+      - name: Copy CADian LISP
+        run: |
+          copy cadian_measure.lsp dist\cadian_measure.lsp
+
+      - name: Upload program
+        uses: actions/upload-artifact@v4
+        with:
+          name: CADian2023-BridgeMeasure
+          path: |
+            dist/BridgeMeasure.exe
+            dist/cadian_measure.lsp
