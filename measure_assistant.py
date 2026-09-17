@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """CADian 2023 교량 실측자료 보조 입력기
-- 5개 측량점 x 6줄 = 30개 고정 표
-- EasyOCR 숫자 후보를 위치/크기 기준으로 30칸에 배치
+- 5개 측량점 x 가변 줄 수 표 (기본 6줄, +/-로 변경)
+- 사용자가 지정한 '실측영역' 안에서만 OCR
+- EasyOCR 숫자 후보를 위치/크기 기준으로 측량점 x 줄 표에 배치
 - 도면의 작은 인쇄 치수는 우선순위를 낮춤
 - 사진 마우스휠 확대/축소, 드래그 이동, 더블클릭 전체보기
 - 표 셀 선택 시 대응 위치 표시/확대
@@ -33,8 +34,7 @@ except Exception:
 
 
 COLS = 5
-ROWS = 6
-TOTAL = COLS * ROWS
+DEFAULT_ROWS = 6
 # 일반적인 거더 간격 실측값 후보 범위. 범위 밖 숫자는 자동배치에서 제외하지만 직접입력은 가능.
 AUTO_MIN_VALUE = 1000
 AUTO_MAX_VALUE = 4000
@@ -62,8 +62,16 @@ class BridgeMeasureApp(tk.Tk):
         self.image_item = None
         self.highlight_item = None
 
+        # 표/실측영역 상태
+        self.rows = DEFAULT_ROWS
+        self.total = COLS * self.rows
+        self.roi = None                 # (x1,y1,x2,y2) - working_cv 원본 좌표
+        self.roi_select_mode = False
+        self.roi_start_canvas = None
+        self.roi_temp_item = None
+
         # 각 셀: value/conf/status/box/source
-        self.cells = [self.empty_cell() for _ in range(TOTAL)]
+        self.cells = [self.empty_cell() for _ in range(self.total)]
         self.col_centers = None
         self.row_centers = None
 
@@ -84,6 +92,18 @@ class BridgeMeasureApp(tk.Tk):
         ttk.Button(toolbar, text="180°", command=lambda: self.rotate_image(180)).pack(side="left", padx=3)
         ttk.Button(toolbar, text="전체보기", command=self.fit_image).pack(side="left", padx=(10, 3))
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        ttk.Button(toolbar, text="실측영역 지정", command=self.start_roi_selection).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="영역 해제", command=self.clear_roi).pack(side="left", padx=3)
+
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Label(toolbar, text="줄 수").pack(side="left", padx=(2, 2))
+        ttk.Button(toolbar, text="－", width=3, command=lambda: self.change_rows(-1)).pack(side="left", padx=1)
+        self.rows_var = tk.StringVar(value=str(self.rows))
+        ttk.Label(toolbar, textvariable=self.rows_var, width=3, anchor="center").pack(side="left", padx=1)
+        ttk.Button(toolbar, text="＋", width=3, command=lambda: self.change_rows(1)).pack(side="left", padx=1)
+
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(toolbar, text="숫자 자동인식(OCR)", command=self.run_ocr).pack(side="left", padx=3)
         ttk.Button(toolbar, text="표 비우기", command=self.clear_values).pack(side="left", padx=3)
         ttk.Button(toolbar, text="CSV 저장", command=self.save_csv).pack(side="right", padx=3)
@@ -92,8 +112,8 @@ class BridgeMeasureApp(tk.Tk):
         guide.pack(fill="x", padx=8, pady=(0, 4))
         ttk.Label(
             guide,
-            text=("1) 사진 불러오기 → 2) 방향 확인/회전 → 3) OCR → 4) 5×6 표와 사진 대조 → "
-                  "5) 빈칸/오류 직접 수정 → 6) CSV 저장 → 7) CADian에서 MEASUREAUTO 실행")
+            text=("1) 사진 불러오기 → 2) 방향 확인/회전 → 3) 줄 수 설정 → 4) 실측영역 지정 → "
+                  "5) OCR → 6) 표와 사진 대조/수정 → 7) CSV 저장 → 8) CADian에서 MEASUREAUTO 실행")
         ).pack(anchor="w")
 
         self.status_var = tk.StringVar(value="실측사진을 불러오세요.  |  휠: 확대/축소  드래그: 이동  더블클릭: 전체보기")
@@ -108,11 +128,12 @@ class BridgeMeasureApp(tk.Tk):
         self.image_canvas.pack(fill="both", expand=True)
         self.image_canvas.bind("<Configure>", self.on_canvas_configure)
         self.image_canvas.bind("<MouseWheel>", self.on_mousewheel)
-        self.image_canvas.bind("<ButtonPress-1>", self.on_drag_start)
-        self.image_canvas.bind("<B1-Motion>", self.on_drag_move)
+        self.image_canvas.bind("<ButtonPress-1>", self.on_canvas_left_down)
+        self.image_canvas.bind("<B1-Motion>", self.on_canvas_left_drag)
+        self.image_canvas.bind("<ButtonRelease-1>", self.on_canvas_left_up)
         self.image_canvas.bind("<Double-Button-1>", lambda e: self.fit_image())
 
-        right = ttk.LabelFrame(self.paned, text="실측값 5개 측량점 × 6줄 - 반드시 검토", padding=5)
+        right = ttk.LabelFrame(self.paned, text="실측값 5개 측량점 × 가변 줄 수 - 반드시 검토", padding=5)
         self.paned.add(right, weight=2)
 
         tree_frame = ttk.Frame(right)
@@ -136,12 +157,13 @@ class BridgeMeasureApp(tk.Tk):
         legend.pack(fill="both", expand=True, pady=(5, 0))
         ttk.Label(
             legend,
-            text=("• OCR은 30칸을 억지로 채우지 않습니다.\n"
+            text=("• 먼저 [실측영역 지정]을 누르고 사진에서 거더 내측 실측부만 드래그하세요.\n"
+                  "• OCR은 지정한 사각형 바깥의 숫자를 완전히 무시합니다.\n"
+                  "• 줄 수는 상단 +/- 버튼으로 3~15줄까지 바꿀 수 있습니다.\n"
                   "• 손글씨로 판단하기 어려운 값은 빈칸/확인 필요로 둡니다.\n"
-                  "• 도면 인쇄 치수는 글자 크기와 위치로 우선순위를 낮춥니다.\n"
                   "• 값을 수정하려면 원하는 칸을 더블클릭하세요.\n"
                   "• 표의 칸을 한 번 클릭하면 사진의 대응 위치가 확대 표시됩니다.\n"
-                  "• CSV 저장 순서: 측량점1의 1~6줄 → 측량점2의 1~6줄 → ... → 측량점5의 1~6줄")
+                  "• CSV 저장 순서: 측량점1의 1~N줄 → 측량점2의 1~N줄 → ... → 측량점5의 1~N줄")
         ).pack(anchor="nw")
 
         self.progress = ttk.Progressbar(right, mode="indeterminate")
@@ -150,28 +172,46 @@ class BridgeMeasureApp(tk.Tk):
     def reset_grid(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
-        for r in range(ROWS):
+        for r in range(self.rows):
             self.tree.insert("", "end", iid=f"r{r}", values=(f"{r+1}줄", "", "", "", "", ""))
         self.refresh_grid()
 
+    def rebuild_grid(self):
+        self.total = COLS * self.rows
+        self.cells = [self.empty_cell() for _ in range(self.total)]
+        self.col_centers = None
+        self.row_centers = None
+        self.rows_var.set(str(self.rows))
+        self.reset_grid()
+        self.redraw_image()
+
+    def change_rows(self, delta):
+        new_rows = max(3, min(15, self.rows + delta))
+        if new_rows == self.rows:
+            return
+        if any(str(x["value"]).strip() for x in self.cells):
+            if not messagebox.askyesno("줄 수 변경", "줄 수를 변경하면 현재 표의 값이 초기화됩니다.\n\n계속할까요?"):
+                return
+        self.rows = new_rows
+        self.rebuild_grid()
+
     def refresh_grid(self):
-        for r in range(ROWS):
+        for r in range(self.rows):
             vals = [f"{r+1}줄"]
             for c in range(COLS):
-                cell = self.cells[c * ROWS + r]
-                v = cell["value"]
-                if v:
-                    vals.append(str(v))
-                else:
-                    vals.append("")
+                cell = self.cells[c * self.rows + r]
+                vals.append(str(cell["value"]) if cell["value"] else "")
             self.tree.item(f"r{r}", values=vals)
         done = sum(1 for x in self.cells if str(x["value"]).strip())
-        need = TOTAL - done
+        need = self.total - done
         if self.image_path:
-            self.status_var.set(f"인식/입력 {done}/{TOTAL}개  |  확인할 빈칸 {need}개  |  휠 확대/축소 · 드래그 이동")
+            roi_text = "실측영역 지정됨" if self.roi else "실측영역 미지정"
+            self.status_var.set(
+                f"인식/입력 {done}/{self.total}개  |  확인할 빈칸 {need}개  |  {roi_text}  |  휠 확대/축소 · 드래그 이동"
+            )
 
     def clear_values(self):
-        self.cells = [self.empty_cell() for _ in range(TOTAL)]
+        self.cells = [self.empty_cell() for _ in range(self.total)]
         self.col_centers = None
         self.row_centers = None
         self.refresh_grid()
@@ -221,9 +261,10 @@ class BridgeMeasureApp(tk.Tk):
             self.image_path = path
             self.original_cv = image.copy()
             self.working_cv = image.copy()
-            self.cells = [self.empty_cell() for _ in range(TOTAL)]
+            self.cells = [self.empty_cell() for _ in range(self.total)]
             self.col_centers = None
             self.row_centers = None
+            self.roi = None
             self.refresh_grid()
             self.after(50, self.fit_image)
         except Exception as e:
@@ -240,9 +281,10 @@ class BridgeMeasureApp(tk.Tk):
             self.working_cv = cv2.rotate(self.working_cv, cv2.ROTATE_90_CLOCKWISE)
         else:
             self.working_cv = cv2.rotate(self.working_cv, cv2.ROTATE_180)
-        self.cells = [self.empty_cell() for _ in range(TOTAL)]
+        self.cells = [self.empty_cell() for _ in range(self.total)]
         self.col_centers = None
         self.row_centers = None
+        self.roi = None
         self.refresh_grid()
         self.after(30, self.fit_image)
 
@@ -285,8 +327,13 @@ class BridgeMeasureApp(tk.Tk):
             cy = ch / 2 + self.offset_y
             self.image_item = self.image_canvas.create_image(cx, cy, image=self.preview_photo, anchor="center")
 
+            # 지정된 실측영역 표시
+            if self.roi:
+                rx1, ry1, rx2, ry2 = self.roi
+                self.draw_source_rect(rx1, ry1, rx2, ry2, cx, cy, w, h, scale, width=2)
+
             # OCR 박스 또는 추정 셀 위치 표시
-            if selected_index is not None and 0 <= selected_index < TOTAL:
+            if selected_index is not None and 0 <= selected_index < self.total:
                 cell = self.cells[selected_index]
                 box = cell.get("box")
                 if box:
@@ -295,8 +342,8 @@ class BridgeMeasureApp(tk.Tk):
                     x1, x2, y1, y2 = min(xs), max(xs), min(ys), max(ys)
                     self.draw_source_rect(x1, y1, x2, y2, cx, cy, w, h, scale)
                 else:
-                    c = selected_index // ROWS
-                    r = selected_index % ROWS
+                    c = selected_index // self.rows
+                    r = selected_index % self.rows
                     if self.col_centers is not None and self.row_centers is not None:
                         x = self.col_centers[c]
                         y = self.row_centers[r]
@@ -306,13 +353,12 @@ class BridgeMeasureApp(tk.Tk):
         except Exception:
             pass
 
-    def draw_source_rect(self, x1, y1, x2, y2, cx, cy, iw, ih, scale):
+    def draw_source_rect(self, x1, y1, x2, y2, cx, cy, iw, ih, scale, width=3):
         left = cx - iw * scale / 2
         top = cy - ih * scale / 2
         X1, Y1 = left + x1 * scale, top + y1 * scale
         X2, Y2 = left + x2 * scale, top + y2 * scale
-        # tkinter 기본 강조색 사용(명시적 색상은 GUI 식별용)
-        self.image_canvas.create_rectangle(X1, Y1, X2, Y2, outline="#ff00aa", width=3)
+        self.image_canvas.create_rectangle(X1, Y1, X2, Y2, outline="#ff00aa", width=width)
 
     def on_mousewheel(self, event):
         if self.working_cv is None:
@@ -331,16 +377,80 @@ class BridgeMeasureApp(tk.Tk):
         self.zoom = new_zoom
         self.redraw_image()
 
-    def on_drag_start(self, event):
-        self.drag_start = (event.x, event.y, self.offset_x, self.offset_y)
+    def canvas_to_image(self, x, y):
+        if self.working_cv is None:
+            return None
+        cw, ch = self.image_canvas.winfo_width(), self.image_canvas.winfo_height()
+        h, w = self.working_cv.shape[:2]
+        scale = self.current_scale()
+        cx, cy = cw/2 + self.offset_x, ch/2 + self.offset_y
+        left, top = cx - w*scale/2, cy - h*scale/2
+        ix = (x - left) / scale
+        iy = (y - top) / scale
+        return max(0.0, min(w-1.0, ix)), max(0.0, min(h-1.0, iy))
 
-    def on_drag_move(self, event):
-        if not self.drag_start:
+    def start_roi_selection(self):
+        if self.working_cv is None:
+            messagebox.showwarning("확인", "먼저 실측사진을 불러오세요.")
             return
-        sx, sy, ox, oy = self.drag_start
-        self.offset_x = ox + (event.x - sx)
-        self.offset_y = oy + (event.y - sy)
+        self.roi_select_mode = True
+        self.roi_start_canvas = None
+        self.status_var.set("실측영역 지정 중: 거더 내측의 손글씨 실측값 전체가 들어가도록 사각형으로 드래그하세요.")
+
+    def clear_roi(self):
+        self.roi = None
+        self.roi_select_mode = False
+        self.roi_start_canvas = None
         self.redraw_image()
+        self.refresh_grid()
+
+    def on_canvas_left_down(self, event):
+        if self.roi_select_mode:
+            self.roi_start_canvas = (event.x, event.y)
+            if self.roi_temp_item:
+                self.image_canvas.delete(self.roi_temp_item)
+                self.roi_temp_item = None
+        else:
+            self.drag_start = (event.x, event.y, self.offset_x, self.offset_y)
+
+    def on_canvas_left_drag(self, event):
+        if self.roi_select_mode and self.roi_start_canvas:
+            x0, y0 = self.roi_start_canvas
+            if self.roi_temp_item:
+                self.image_canvas.delete(self.roi_temp_item)
+            self.roi_temp_item = self.image_canvas.create_rectangle(
+                x0, y0, event.x, event.y, outline="#ff00aa", width=3
+            )
+        elif self.drag_start:
+            sx, sy, ox, oy = self.drag_start
+            self.offset_x = ox + (event.x - sx)
+            self.offset_y = oy + (event.y - sy)
+            self.redraw_image()
+
+    def on_canvas_left_up(self, event):
+        if self.roi_select_mode and self.roi_start_canvas:
+            p1 = self.canvas_to_image(*self.roi_start_canvas)
+            p2 = self.canvas_to_image(event.x, event.y)
+            self.roi_start_canvas = None
+            self.roi_select_mode = False
+            self.roi_temp_item = None
+            if p1 and p2:
+                x1, y1 = p1
+                x2, y2 = p2
+                x1, x2 = sorted((x1, x2))
+                y1, y2 = sorted((y1, y2))
+                h, w = self.working_cv.shape[:2]
+                if (x2-x1) < w*0.08 or (y2-y1) < h*0.08:
+                    messagebox.showwarning("영역 확인", "선택 영역이 너무 작습니다. 다시 지정해주세요.")
+                    self.roi = None
+                else:
+                    self.roi = (x1, y1, x2, y2)
+                    self.cells = [self.empty_cell() for _ in range(self.total)]
+                    self.col_centers = None
+                    self.row_centers = None
+                    self.refresh_grid()
+            self.redraw_image()
+        self.drag_start = None
 
     # --------------------------------------------------------- OCR
     def get_reader(self):
@@ -386,20 +496,31 @@ class BridgeMeasureApp(tk.Tk):
         return sorted(centers)
 
     def prepare_ocr_images(self):
-        image = self.working_cv.copy()
+        if not self.roi:
+            raise RuntimeError("먼저 [실측영역 지정] 버튼으로 거더 내측 실측영역을 지정하세요.")
+
+        x1, y1, x2, y2 = self.roi
+        x1i, y1i = max(0, int(x1)), max(0, int(y1))
+        x2i, y2i = min(self.working_cv.shape[1], int(x2)), min(self.working_cv.shape[0], int(y2))
+        image = self.working_cv[y1i:y2i, x1i:x2i].copy()
+        if image.size == 0:
+            raise RuntimeError("실측영역이 올바르지 않습니다. 영역을 다시 지정하세요.")
+
         h0, w0 = image.shape[:2]
         max_side = max(h0, w0)
         scale = 1.0
         if max_side > 3200:
             scale = 3200.0 / max_side
             image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        # 손글씨가 연한 경우 대비 강화
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(gray)
-        return np.ascontiguousarray(image), np.ascontiguousarray(enhanced), scale
 
-    def collect_candidates(self, reader, img, scale_back, pass_name):
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+
+        # ROI 내부 좌표를 원본 사진 좌표로 되돌리기 위한 offset
+        return np.ascontiguousarray(image), np.ascontiguousarray(enhanced), scale, (x1i, y1i)
+
+    def collect_candidates(self, reader, img, scale_back, pass_name, offset=(0, 0)):
         results = reader.readtext(img, detail=1, paragraph=False, decoder="greedy", allowlist="0123456789OoIlS")
         out = []
         for result in results:
@@ -415,8 +536,12 @@ class BridgeMeasureApp(tk.Tk):
             except Exception:
                 continue
             # 원본 working_cv 좌표로 환산
-            cx /= scale_back; cy /= scale_back; bw /= scale_back; bh /= scale_back
-            box_orig = [[float(p[0])/scale_back, float(p[1])/scale_back] for p in box]
+            ox, oy = offset
+            cx = cx / scale_back + ox
+            cy = cy / scale_back + oy
+            bw /= scale_back
+            bh /= scale_back
+            box_orig = [[float(p[0])/scale_back + ox, float(p[1])/scale_back + oy] for p in box]
             for n in nums:
                 v = int(n)
                 if not (AUTO_MIN_VALUE <= v <= AUTO_MAX_VALUE):
@@ -442,56 +567,71 @@ class BridgeMeasureApp(tk.Tk):
 
     def infer_grid_and_assign(self, candidates):
         h, w = self.working_cv.shape[:2]
-        # 제목/가장자리 치수영역을 강하게 제외. 실제 실측 글씨는 교량 본체 내부에 존재.
-        core = [x for x in candidates if (0.04*w <= x["x"] <= 0.96*w and 0.18*h <= x["y"] <= 0.90*h)]
-        if len(core) < 10:
-            core = candidates[:]
+        if not self.roi:
+            raise RuntimeError("실측영역이 지정되지 않았습니다.")
+        x1, y1, x2, y2 = self.roi
+        rw, rh = x2-x1, y2-y1
 
-        # 작은 인쇄치수보다 큰 손글씨를 우선해 grid 중심 추정
+        # OCR 후보는 이미 ROI crop에서 나온 값이지만, 안전하게 영역 내부만 다시 사용
+        core = [x for x in candidates if x1 <= x["x"] <= x2 and y1 <= x["y"] <= y2]
+
         heights = sorted(x["h"] for x in core)
-        med_h = heights[len(heights)//2] if heights else 1.0
-        prominent = [x for x in core if x["h"] >= med_h * 0.9]
-        if len(prominent) < 12:
+        med_h = heights[len(heights)//2] if heights else max(1.0, rh*0.025)
+
+        # 큰 글씨(손글씨) 우선
+        prominent = [x for x in core if x["h"] >= med_h * 0.90]
+        if len(prominent) < max(6, self.rows):
             prominent = core
 
+        # 열/행 중심은 OCR이 부족해도 ROI를 균등분할해서 안정적으로 유지
+        # 실제 손글씨 위치가 충분하면 OCR 군집 중심을 사용
         xs = [x["x"] for x in prominent]
         ys = [x["y"] for x in prominent]
-        col_centers = self.cluster_1d(xs, COLS)
-        row_centers = self.cluster_1d(ys, ROWS)
-        if col_centers is None or row_centers is None:
-            # 최소한 사진 내부를 균등 분할한 추정 위치 제공
-            col_centers = [w*(0.10 + 0.20*i) for i in range(COLS)]
-            row_centers = [h*(0.30 + 0.10*i) for i in range(ROWS)]
+        col_centers = self.cluster_1d(xs, COLS) if len(xs) >= COLS else None
+        row_centers = self.cluster_1d(ys, self.rows) if len(ys) >= self.rows else None
 
-        # 행/열 간격
-        cgap = sum(col_centers[i+1]-col_centers[i] for i in range(COLS-1))/(COLS-1)
-        rgap = sum(row_centers[i+1]-row_centers[i] for i in range(ROWS-1))/(ROWS-1)
+        if col_centers is None:
+            col_centers = [x1 + rw*(i+0.5)/COLS for i in range(COLS)]
+        if row_centers is None:
+            row_centers = [y1 + rh*(i+0.5)/self.rows for i in range(self.rows)]
 
-        cells = [self.empty_cell() for _ in range(TOTAL)]
+        cgap = rw / COLS
+        rgap = rh / self.rows
+
+        cells = [self.empty_cell() for _ in range(self.total)]
+        used = set()
+
         for c in range(COLS):
-            for r in range(ROWS):
+            for r in range(self.rows):
                 cx0, cy0 = col_centers[c], row_centers[r]
                 choices = []
-                for it in core:
+                for j, it in enumerate(core):
+                    if j in used:
+                        continue
                     dx = abs(it["x"]-cx0) / max(1.0, cgap)
                     dy = abs(it["y"]-cy0) / max(1.0, rgap)
-                    if dx <= 0.42 and dy <= 0.42:
-                        # 손글씨는 대체로 인쇄치수보다 크다. 높이를 중요한 점수로 사용.
+                    # 한 칸 중심 주변만 허용: 외곽/옆 칸 숫자 유입 감소
+                    if dx <= 0.46 and dy <= 0.46:
                         size_score = min(2.0, it["h"] / max(1.0, med_h))
-                        pos_score = max(0.0, 1.0 - (dx*dx + dy*dy))
-                        score = 1.15*size_score + 0.55*it["confidence"] + 1.10*pos_score
-                        choices.append((score, it))
+                        pos_score = max(0.0, 1.0 - 0.9*dx*dx - 1.2*dy*dy)
+                        score = 1.20*size_score + 0.55*it["confidence"] + 1.25*pos_score
+                        choices.append((score, j, it))
+
                 if choices:
                     choices.sort(key=lambda z: z[0], reverse=True)
-                    score, best = choices[0]
-                    # 너무 작은/불확실 후보는 자동확정하지 않는다.
-                    reliable = best["h"] >= med_h*0.78 and score >= 2.15
+                    score, j, best = choices[0]
+                    reliable = best["h"] >= med_h*0.75 and score >= 2.10
                     if reliable:
+                        used.add(j)
                         status = "자동 인식" if best["confidence"] >= 0.55 else "확인 필요"
-                        cells[c*ROWS+r] = {
-                            "value": str(best["value"]), "confidence": best["confidence"],
-                            "status": status, "box": best["box"], "source": best["raw"]
+                        cells[c*self.rows+r] = {
+                            "value": str(best["value"]),
+                            "confidence": best["confidence"],
+                            "status": status,
+                            "box": best["box"],
+                            "source": best["raw"]
                         }
+
         return cells, col_centers, row_centers
 
     def run_ocr(self):
@@ -504,14 +644,17 @@ class BridgeMeasureApp(tk.Tk):
             return
         try:
             self.title("교량 실측 CAD 자동작성 - 숫자 인식 중...")
-            self.status_var.set("손글씨 실측값 후보를 찾고 5×6 위치에 배치하고 있습니다...")
+            if not self.roi:
+                messagebox.showwarning("실측영역 필요", "먼저 [실측영역 지정]을 눌러 거더 내측의 손글씨 실측부만 사각형으로 지정하세요.")
+                return
+            self.status_var.set(f"지정한 실측영역 안에서 손글씨 후보를 찾아 5×{self.rows} 표에 배치하고 있습니다...")
             self.progress.start(10)
             self.update_idletasks()
             reader = self.get_reader()
-            color, enhanced, scale = self.prepare_ocr_images()
+            color, enhanced, scale, offset = self.prepare_ocr_images()
             candidates = []
-            candidates += self.collect_candidates(reader, color, scale, "원본")
-            candidates += self.collect_candidates(reader, enhanced, scale, "강조")
+            candidates += self.collect_candidates(reader, color, scale, "원본", offset)
+            candidates += self.collect_candidates(reader, enhanced, scale, "강조", offset)
             candidates = self.dedupe_candidates(candidates)
             self.cells, self.col_centers, self.row_centers = self.infer_grid_and_assign(candidates)
             self.refresh_grid()
@@ -545,7 +688,7 @@ class BridgeMeasureApp(tk.Tk):
         if col_num < 2 or col_num > 6:
             return None
         c = col_num - 2
-        return r, c, c*ROWS+r, col_id
+        return r, c, c*self.rows+r, col_id
 
     def on_tree_click(self, event):
         info = self.tree_cell_from_event(event)
@@ -565,7 +708,7 @@ class BridgeMeasureApp(tk.Tk):
             xs = [p[0] for p in cell["box"]]; ys = [p[1] for p in cell["box"]]
             tx, ty = sum(xs)/len(xs), sum(ys)/len(ys)
         elif self.col_centers is not None and self.row_centers is not None:
-            c, r = idx//ROWS, idx%ROWS
+            c, r = idx//self.rows, idx%self.rows
             tx, ty = self.col_centers[c], self.row_centers[r]
         else:
             self.redraw_image(idx)
@@ -621,11 +764,11 @@ class BridgeMeasureApp(tk.Tk):
         values = []
         # CADian 입력 순서: 측량점 1의 1~6줄, 측량점2의 1~6줄 ...
         for c in range(COLS):
-            for r in range(ROWS):
-                idx = c*ROWS+r
+            for r in range(self.rows):
+                idx = c*self.rows+r
                 value = str(self.cells[idx]["value"]).strip()
                 if not value:
-                    messagebox.showwarning("빈칸 확인", f"측량점 {c+1} / {r+1}줄이 비어 있습니다.\n\n사진과 대조하여 30개 값을 모두 확인한 후 저장해주세요.")
+                    messagebox.showwarning("빈칸 확인", f"측량점 {c+1} / {r+1}줄이 비어 있습니다.\n\n사진과 대조하여 {self.total}개 값을 모두 확인한 후 저장해주세요.")
                     self.focus_cell(idx)
                     return
                 try:
@@ -649,7 +792,7 @@ class BridgeMeasureApp(tk.Tk):
                     writer.writerow([i, value])
         except Exception as e:
             messagebox.showerror("CSV 저장 오류", str(e)); return
-        messagebox.showinfo("저장 완료", f"30개 실측값을 CADian용 CSV로 저장했습니다.\n\n{path}\n\nCADian에서 MEASUREAUTO를 실행하세요.")
+        messagebox.showinfo("저장 완료", f"{self.total}개 실측값을 CADian용 CSV로 저장했습니다.\n\n{path}\n\nCADian에서 MEASUREAUTO를 실행하세요.")
 
 
 if __name__ == "__main__":
