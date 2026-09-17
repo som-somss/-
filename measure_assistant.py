@@ -545,6 +545,146 @@ class BridgeMeasureApp(tk.Tk):
 
         self.drag_start = None
 
+
+    def start_measure_points(self):
+        if self.working_cv is None:
+            messagebox.showwarning("확인", "먼저 실측사진을 불러오세요.")
+            return
+        if not self.roi:
+            messagebox.showwarning("확인", "먼저 [실측영역 지정]으로 거더 내측 영역을 지정하세요.")
+            return
+        self.measure_xs = []
+        self.measure_pick_mode = True
+        self.status_var.set("측량점 지정: 사진에서 측량점1 → 2 → 3 → 4 → 5의 손글씨 열을 차례대로 클릭하세요.")
+        self.redraw_image()
+
+    def _canvas_to_image(self, event):
+        # 기존 표시 파라미터가 있으면 사용하고, 없으면 현재 canvas/image 크기로 환산
+        try:
+            cw = max(1, self.canvas.winfo_width())
+            ch = max(1, self.canvas.winfo_height())
+            ih, iw = self.working_cv.shape[:2]
+            scale = min(cw/iw, ch/ih) * self.zoom
+            dw, dh = iw*scale, ih*scale
+            ox = (cw-dw)/2 + getattr(self, "pan_x", 0)
+            oy = (ch-dh)/2 + getattr(self, "pan_y", 0)
+            x = (event.x-ox)/scale
+            y = (event.y-oy)/scale
+            return x, y
+        except Exception:
+            return None, None
+
+    def _handle_measure_point_click(self, event):
+        if not self.measure_pick_mode:
+            return False
+        x, y = self._canvas_to_image(event)
+        if x is None:
+            return True
+        x1, y1, x2, y2 = self.roi
+        if not (x1 <= x <= x2 and y1 <= y <= y2):
+            self.status_var.set("분홍색 실측영역 안에서 측량점의 손글씨 열을 클릭하세요.")
+            return True
+        self.measure_xs.append(float(x))
+        self.measure_xs = sorted(self.measure_xs)
+        if len(self.measure_xs) >= 5:
+            self.measure_xs = self.measure_xs[:5]
+            self.measure_pick_mode = False
+            self.status_var.set("측량점 5개 지정 완료. 이제 [숫자 자동인식(OCR)]을 누르세요.")
+        else:
+            self.status_var.set(f"측량점 {len(self.measure_xs)}개 지정됨 / 5개. 다음 측량점을 클릭하세요.")
+        self.redraw_image()
+        return True
+
+    def _recognize_strip(self, reader, c):
+        """한 측량점 세로 띠를 한 번 OCR하고, 결과를 실제 N개 줄에 Y좌표로 배치."""
+        x1, y1, x2, y2 = self.roi
+        xs = sorted(self.measure_xs)
+        # 이웃 측량점 중간을 경계로 하되, 폭을 줄여 다른 열 침범 방지
+        if c == 0:
+            left = x1
+        else:
+            left = (xs[c-1] + xs[c]) / 2.0
+        if c == 4:
+            right = x2
+        else:
+            right = (xs[c] + xs[c+1]) / 2.0
+
+        half = min((right-left)*0.36, max(35.0, (x2-x1)*0.055))
+        sx1 = max(x1, xs[c]-half)
+        sx2 = min(x2, xs[c]+half)
+        sy1, sy2 = y1, y2
+
+        h, w = self.working_cv.shape[:2]
+        ix1, ix2 = max(0,int(sx1)), min(w,int(sx2))
+        iy1, iy2 = max(0,int(sy1)), min(h,int(sy2))
+        crop = self.working_cv[iy1:iy2, ix1:ix2].copy()
+        if crop.size == 0:
+            return [self.empty_cell() for _ in range(self.rows)]
+
+        # 2배 확대 + 대비 강화. 세로 띠당 OCR 1회.
+        scale = 2.0
+        up = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8,8))
+        proc = clahe.apply(gray)
+
+        results = reader.readtext(
+            np.ascontiguousarray(proc),
+            detail=1, paragraph=False,
+            allowlist="0123456789",
+            decoder="greedy", batch_size=1, workers=0,
+            min_size=14, text_threshold=0.35, low_text=0.18,
+            link_threshold=0.25, canvas_size=2560, mag_ratio=1.0,
+            slope_ths=0.20, ycenter_ths=0.7, height_ths=0.7,
+            width_ths=1.0, add_margin=0.08
+        )
+
+        candidates = []
+        for box, raw, conf in results:
+            digits = clean_digits(raw)
+            if len(digits) != 4:
+                continue
+            pts = np.asarray(box, dtype=float).reshape(-1,2)
+            bx1, by1 = pts[:,0].min(), pts[:,1].min()
+            bx2, by2 = pts[:,0].max(), pts[:,1].max()
+            bw, bh = bx2-bx1, by2-by1
+            # 세로 인쇄 치수/아주 작은 숫자 제거
+            if bh > bw*1.30 or bh < proc.shape[0]*0.018:
+                continue
+            cx_local = (bx1+bx2)/2.0/scale
+            cy_global = iy1 + ((by1+by2)/2.0)/scale
+            cx_global = ix1 + cx_local
+            # 사용자가 찍은 열 중심에 가까운 숫자 우선
+            dx = abs(cx_global-xs[c]) / max(1.0, half)
+            score = float(conf) + max(0.0, 0.55-0.35*dx)
+            candidates.append((digits, float(conf), score, cx_global, cy_global, box))
+
+        # 행 중심: ROI를 N등분. 후보는 가장 가까운 행에만 배치.
+        row_centers = [y1 + (r+0.5)*(y2-y1)/self.rows for r in range(self.rows)]
+        row_h = (y2-y1)/self.rows
+        cells = [self.empty_cell() for _ in range(self.rows)]
+        best = [-1.0]*self.rows
+
+        for digits, conf, score, gx, gy, box in candidates:
+            r = min(range(self.rows), key=lambda rr: abs(gy-row_centers[rr]))
+            if abs(gy-row_centers[r]) > row_h*0.46:
+                continue
+            if score > best[r]:
+                best[r] = score
+                reliable = conf >= 0.42
+                cells[r] = {
+                    "value": digits if reliable else "",
+                    "confidence": conf,
+                    "status": "자동 인식" if reliable else "확인 필요",
+                    "box": None,
+                    "source": f"측량점{c+1} 세로띠",
+                    "crop_rect": (ix1, max(iy1,int(row_centers[r]-row_h/2)),
+                                  ix2, min(iy2,int(row_centers[r]+row_h/2))),
+                    "crop_image": crop,
+                    "suggestion": digits
+                }
+        return cells
+
     # --------------------------------------------------------- OCR
     def get_reader(self):
         if self.reader is None:
@@ -841,42 +981,45 @@ class BridgeMeasureApp(tk.Tk):
 
     def run_ocr(self):
         if self.working_cv is None:
-            messagebox.showwarning("확인","먼저 실측사진을 불러오세요."); return
-        if not OCR_AVAILABLE:
-            p=self.save_error_log(OCR_IMPORT_ERROR)
-            messagebox.showerror("OCR 오류",f"OCR 엔진을 불러오지 못했습니다.\n\n상세 오류: {p or '-'}"); return
+            messagebox.showwarning("확인", "먼저 실측사진을 불러오세요.")
+            return
         if not self.roi:
-            messagebox.showwarning("실측영역 필요","먼저 [실측영역 지정]으로 실측부를 지정하세요."); return
+            messagebox.showwarning("확인", "먼저 [실측영역 지정]을 해주세요.")
+            return
+        if len(self.measure_xs) != 5:
+            messagebox.showwarning(
+                "측량점 지정 필요",
+                "먼저 [측량점 5개 지정]을 누르고 사진에서 측량점1→5의 손글씨 열을 차례대로 클릭하세요."
+            )
+            return
         try:
-            self.title("교량 실측 CAD 자동작성 - 개별 칸 OCR 중...")
-            self.progress.start(10); self.update_idletasks()
-            reader=self.get_reader()
+            reader = self.get_reader()
+            all_cells = []
+            for c in range(5):
+                self.status_var.set(f"빠른 OCR {c+1}/5 | 측량점 {c+1} 세로열 인식 중...")
+                self.root.update_idletasks()
+                strip_cells = self._recognize_strip(reader, c)
+                all_cells.extend(strip_cells)
 
-            # 1단계: 전체 영역에서는 값 채우기가 아니라 실제 행(Y) 위치만 찾는다.
-            self.status_var.set("1/2 실제 거더 실측 줄 위치를 찾는 중..."); self.update_idletasks()
-            color,enhanced,scale,offset=self.prepare_ocr_images()
-            cand=self.collect_candidates(reader,color,scale,"원본",offset)+self.collect_candidates(reader,enhanced,scale,"강조",offset)
-            cand=self.dedupe_candidates(cand)
-            _,self.col_centers,self.row_centers=self.infer_grid_and_assign(cand)
+            self.cells = all_cells
+            x1,y1,x2,y2 = self.roi
+            self.col_centers = sorted(self.measure_xs)
+            self.row_centers = [y1+(r+0.5)*(y2-y1)/self.rows for r in range(self.rows)]
+            self.refresh_grid()
+            self.redraw_image()
 
-            # 2단계: 5 x N 각각을 따로 잘라 확대/보정/OCR한다.
-            cells=[]
-            for c in range(COLS):
-                for r in range(self.rows):
-                    self.status_var.set(f"2/2 개별 OCR {len(cells)+1}/{self.total} | 측량점 {c+1} / {r+1}줄")
-                    self.update_idletasks()
-                    cells.append(self.recognize_one_cell(reader,c,r))
-            self.cells=cells
-            self.refresh_grid(); self.redraw_image()
-            done=sum(1 for x in self.cells if x['value'])
-            sug=sum(1 for x in self.cells if not x['value'] and x.get('suggestion'))
-            self.status_var.set(f"개별 OCR 완료 | 자동입력 {done}/{self.total} | 확인 후보 {sug} | 빈칸/후보는 사진과 대조")
-            messagebox.showinfo("OCR 완료",f"각 칸을 따로 확대/보정해서 인식했습니다.\n\n자동입력: {done}/{self.total}\n확인 후보: {sug}\n\n전처리 결과가 서로 다르면 억지로 값을 넣지 않습니다.")
+            done = sum(1 for x in self.cells if str(x.get("value","")).strip())
+            self.status_var.set(
+                f"빠른 OCR 완료 | 자동입력 {done}/{self.total}개 | 측량점 위치 기준으로 행 배치"
+            )
+            messagebox.showinfo(
+                "OCR 완료",
+                f"측량점 세로열 5개만 OCR했습니다.\n자동 입력: {done}/{self.total}개\n\n"
+                "이번 버전은 OCR 속도와 '다른 측량점으로 값이 넘어가는 문제'를 우선 개선한 테스트 버전입니다."
+            )
         except Exception as e:
-            p=self.save_error_log(traceback.format_exc())
-            messagebox.showerror("OCR 실행 오류",f"OCR 처리 중 오류가 발생했습니다.\n\n{e}\n\n상세 오류: {p or '-'}")
-        finally:
-            self.progress.stop(); self.title("교량 실측 CAD 자동작성")
+            self.log_error(e)
+            messagebox.showerror("OCR 실행 오류", f"OCR 처리 중 오류가 발생했습니다.\n\n{e}")
 
     # --------------------------------------------------------- 표 선택/편집
     def tree_cell_from_event(self, event):
