@@ -83,7 +83,7 @@ class BridgeMeasureApp(tk.Tk):
 
     @staticmethod
     def empty_cell():
-        return {"value": "", "confidence": 0.0, "status": "확인 필요", "box": None, "source": ""}
+        return {"value": "", "confidence": 0.0, "status": "확인 필요", "box": None, "source": "", "crop_rect": None, "suggestion": ""}
 
     # --------------------------------------------------------- UI
     def create_ui(self):
@@ -750,45 +750,125 @@ class BridgeMeasureApp(tk.Tk):
 
         return cells, col_centers, row_centers
 
+    def cell_crop_rect(self, c, r):
+        if not self.roi:
+            return None
+        x1,y1,x2,y2=self.roi
+        rw=x2-x1
+        cols=self.col_centers or [x1+rw*(i+0.5)/COLS for i in range(COLS)]
+        rows=self.row_centers or [y1+(y2-y1)*(i+0.5)/self.rows for i in range(self.rows)]
+        xe=[x1]+[(cols[i]+cols[i+1])/2.0 for i in range(COLS-1)]+[x2]
+        ye=[y1]+[(rows[i]+rows[i+1])/2.0 for i in range(self.rows-1)]+[y2]
+        lx,rx=xe[c],xe[c+1]; ty,by=ye[r],ye[r+1]
+        # 각 칸의 경계 치수선을 줄이기 위해 안쪽으로 약간 축소
+        mx=(rx-lx)*0.08; my=(by-ty)*0.08
+        return lx+mx,ty+my,rx-mx,by-my
+
+    def crop_cell_image(self,c,r):
+        rect=self.cell_crop_rect(c,r)
+        if not rect: return None,None
+        x1,y1,x2,y2=rect
+        h,w=self.working_cv.shape[:2]
+        a,b=max(0,int(x1)),max(0,int(y1)); d,e=min(w,int(x2)),min(h,int(y2))
+        if d<=a or e<=b: return None,None
+        return self.working_cv[b:e,a:d].copy(),(a,b,d,e)
+
+    def cell_variants(self,crop):
+        if crop is None or crop.size==0: return []
+        h,w=crop.shape[:2]
+        s=max(2.0,240.0/max(1,h))
+        up=cv2.resize(crop,None,fx=s,fy=s,interpolation=cv2.INTER_CUBIC)
+        gray=cv2.cvtColor(up,cv2.COLOR_BGR2GRAY)
+        clahe=cv2.createCLAHE(clipLimit=2.4,tileGridSize=(8,8))
+        con=clahe.apply(gray)
+        blur=cv2.GaussianBlur(con,(3,3),0)
+        _,otsu=cv2.threshold(blur,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        ada=cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,31,11)
+        inv=255-ada
+        hk=cv2.getStructuringElement(cv2.MORPH_RECT,(max(25,inv.shape[1]//7),1))
+        vk=cv2.getStructuringElement(cv2.MORPH_RECT,(1,max(25,inv.shape[0]//3)))
+        lines=cv2.bitwise_or(cv2.morphologyEx(inv,cv2.MORPH_OPEN,hk),cv2.morphologyEx(inv,cv2.MORPH_OPEN,vk))
+        clean=255-cv2.subtract(inv,lines)
+        return [('원본확대',up),('대비강조',con),('Otsu',otsu),('선제거',clean)]
+
+    def ocr_cell_variant(self,reader,img,name):
+        try:
+            res=reader.readtext(np.ascontiguousarray(img),detail=1,paragraph=False,allowlist='0123456789',decoder='greedy',min_size=12,text_threshold=0.30,low_text=0.15,link_threshold=0.20,canvas_size=2560,mag_ratio=1.5,add_margin=0.08)
+        except Exception:
+            return []
+        ih,iw=img.shape[:2]; out=[]
+        for box,raw,conf in res:
+            dig=clean_digits(raw)
+            if len(dig)!=4: continue
+            try:
+                pts=np.asarray(box,dtype=float).reshape(-1,2)
+                bx1,by1=pts[:,0].min(),pts[:,1].min(); bx2,by2=pts[:,0].max(),pts[:,1].max()
+                bw,bh=bx2-bx1,by2-by1
+                if bh<ih*0.10 or bw<iw*0.07 or bh>bw*1.45: continue
+                cx,cy=(bx1+bx2)/2,(by1+by2)/2
+                dx=abs(cx-iw/2)/max(1,iw/2); dy=abs(cy-ih/2)/max(1,ih/2)
+                center=max(0.0,1.0-0.45*dx-0.70*dy)
+                out.append((dig,float(conf),float(conf)*1.4+center,name))
+            except Exception: pass
+        return out
+
+    def recognize_one_cell(self,reader,c,r):
+        crop,rect=self.crop_cell_image(c,r)
+        cell=self.empty_cell(); cell['crop_rect']=rect
+        if crop is None: return cell
+        votes={}
+        for name,img in self.cell_variants(crop):
+            for dig,conf,score,vname in self.ocr_cell_variant(reader,img,name):
+                z=votes.setdefault(dig,{'n':0,'score':0.0,'conf':0.0,'src':[]})
+                z['n']+=1; z['score']+=score; z['conf']=max(z['conf'],conf); z['src'].append(vname)
+        if not votes: return cell
+        dig,z=max(votes.items(),key=lambda kv:(kv[1]['n'],kv[1]['score'],kv[1]['conf']))
+        cell['suggestion']=dig; cell['confidence']=z['conf']; cell['source']='/'.join(z['src'])
+        # 서로 다른 전처리에서 2회 이상 같은 값이 나온 경우 위주로 자동입력
+        if z['n']>=2 or (z['conf']>=0.82 and z['score']>=1.70):
+            cell['value']=dig; cell['status']='자동 인식'
+        else:
+            cell['status']='확인 필요'
+        return cell
+
     def run_ocr(self):
         if self.working_cv is None:
-            messagebox.showwarning("확인", "먼저 실측사진을 불러오세요.")
-            return
+            messagebox.showwarning("확인","먼저 실측사진을 불러오세요."); return
         if not OCR_AVAILABLE:
-            p = self.save_error_log(OCR_IMPORT_ERROR)
-            messagebox.showerror("OCR 오류", f"OCR 엔진을 불러오지 못했습니다.\n\n상세 오류: {p or '-'}")
-            return
+            p=self.save_error_log(OCR_IMPORT_ERROR)
+            messagebox.showerror("OCR 오류",f"OCR 엔진을 불러오지 못했습니다.\n\n상세 오류: {p or '-'}"); return
+        if not self.roi:
+            messagebox.showwarning("실측영역 필요","먼저 [실측영역 지정]으로 실측부를 지정하세요."); return
         try:
-            self.title("교량 실측 CAD 자동작성 - 숫자 인식 중...")
-            if not self.roi:
-                messagebox.showwarning("실측영역 필요", "먼저 [실측영역 지정]을 눌러 거더 내측의 손글씨 실측부만 사각형으로 지정하세요.")
-                return
-            self.status_var.set(f"지정한 실측영역 안에서 손글씨 후보를 찾아 5×{self.rows} 표에 배치하고 있습니다...")
-            self.progress.start(10)
-            self.update_idletasks()
-            reader = self.get_reader()
-            color, enhanced, scale, offset = self.prepare_ocr_images()
-            candidates = []
-            candidates += self.collect_candidates(reader, color, scale, "원본", offset)
-            candidates += self.collect_candidates(reader, enhanced, scale, "강조", offset)
-            candidates = self.dedupe_candidates(candidates)
-            self.cells, self.col_centers, self.row_centers = self.infer_grid_and_assign(candidates)
-            self.refresh_grid()
-            self.redraw_image()
-            done = sum(1 for x in self.cells if x["value"])
-            messagebox.showinfo(
-                "OCR 완료",
-                f"5개 측량점 × {self.rows}줄 = 총 {self.total}칸 중 {done}칸에 숫자 후보를 배치했습니다.\n\n"
-                "빈칸은 사진을 보고 직접 입력하세요.\n"
-                "자동 입력된 값도 반드시 원본과 대조하세요.\n\n"
-                "표의 칸을 클릭하면 사진의 해당 위치를 확대해서 볼 수 있습니다."
-            )
+            self.title("교량 실측 CAD 자동작성 - 개별 칸 OCR 중...")
+            self.progress.start(10); self.update_idletasks()
+            reader=self.get_reader()
+
+            # 1단계: 전체 영역에서는 값 채우기가 아니라 실제 행(Y) 위치만 찾는다.
+            self.status_var.set("1/2 실제 거더 실측 줄 위치를 찾는 중..."); self.update_idletasks()
+            color,enhanced,scale,offset=self.prepare_ocr_images()
+            cand=self.collect_candidates(reader,color,scale,"원본",offset)+self.collect_candidates(reader,enhanced,scale,"강조",offset)
+            cand=self.dedupe_candidates(cand)
+            _,self.col_centers,self.row_centers=self.infer_grid_and_assign(cand)
+
+            # 2단계: 5 x N 각각을 따로 잘라 확대/보정/OCR한다.
+            cells=[]
+            for c in range(COLS):
+                for r in range(self.rows):
+                    self.status_var.set(f"2/2 개별 OCR {len(cells)+1}/{self.total} | 측량점 {c+1} / {r+1}줄")
+                    self.update_idletasks()
+                    cells.append(self.recognize_one_cell(reader,c,r))
+            self.cells=cells
+            self.refresh_grid(); self.redraw_image()
+            done=sum(1 for x in self.cells if x['value'])
+            sug=sum(1 for x in self.cells if not x['value'] and x.get('suggestion'))
+            self.status_var.set(f"개별 OCR 완료 | 자동입력 {done}/{self.total} | 확인 후보 {sug} | 빈칸/후보는 사진과 대조")
+            messagebox.showinfo("OCR 완료",f"각 칸을 따로 확대/보정해서 인식했습니다.\n\n자동입력: {done}/{self.total}\n확인 후보: {sug}\n\n전처리 결과가 서로 다르면 억지로 값을 넣지 않습니다.")
         except Exception as e:
-            p = self.save_error_log(traceback.format_exc())
-            messagebox.showerror("OCR 실행 오류", f"OCR 처리 중 오류가 발생했습니다.\n\n{e}\n\n상세 오류: {p or '-'}")
+            p=self.save_error_log(traceback.format_exc())
+            messagebox.showerror("OCR 실행 오류",f"OCR 처리 중 오류가 발생했습니다.\n\n{e}\n\n상세 오류: {p or '-'}")
         finally:
-            self.progress.stop()
-            self.title("교량 실측 CAD 자동작성")
+            self.progress.stop(); self.title("교량 실측 CAD 자동작성")
 
     # --------------------------------------------------------- 표 선택/편집
     def tree_cell_from_event(self, event):
@@ -823,6 +903,9 @@ class BridgeMeasureApp(tk.Tk):
         if cell.get("box"):
             xs = [p[0] for p in cell["box"]]; ys = [p[1] for p in cell["box"]]
             tx, ty = sum(xs)/len(xs), sum(ys)/len(ys)
+        elif cell.get("crop_rect"):
+            x1,y1,x2,y2=cell["crop_rect"]
+            tx,ty=(x1+x2)/2.0,(y1+y2)/2.0
         elif self.col_centers is not None and self.row_centers is not None:
             c, r = idx//self.rows, idx%self.rows
             tx, ty = self.col_centers[c], self.row_centers[r]
