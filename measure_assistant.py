@@ -131,6 +131,7 @@ class BridgeMeasureApp(tk.Tk):
         ttk.Button(toolbar, text="측량점 5개 지정", command=self.start_measure_points).pack(side="left", padx=3)
         ttk.Button(toolbar, text="OCR 영역 보기", command=self.toggle_cell_regions).pack(side="left", padx=3)
         ttk.Button(toolbar, text="선택칸 영역 조정", command=self.start_cell_adjustment).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="선택칸 자동영역 복원", command=self.reset_selected_cell_region).pack(side="left", padx=3)
         ttk.Button(toolbar, text="숫자 자동인식(OCR)", command=self.run_ocr).pack(side="left", padx=3)
         ttk.Button(toolbar, text="표 비우기", command=self.clear_values).pack(side="left", padx=3)
         ttk.Button(toolbar, text="CSV 저장", command=self.save_csv).pack(side="right", padx=3)
@@ -140,7 +141,7 @@ class BridgeMeasureApp(tk.Tk):
         ttk.Label(
             guide,
             text=("1) 사진 불러오기 → 2) 방향 확인/회전 → 3) 줄 수 설정 → 4) 실측영역 지정 → "
-                  "5) 측량점 5개 지정 → 6) OCR 영역 보기/필요시 조정 → 7) OCR → 8) 표와 사진 대조/수정 → 9) CSV 저장 → 10) CADian에서 MEASUREAUTO 실행")
+                  "5) 측량점 5개 지정 → 6) OCR 영역 보기/필요시 반복 조정/복원 → 7) OCR → 8) 표와 사진 대조/수정 → 9) CSV 저장 → 10) CADian에서 MEASUREAUTO 실행")
         ).pack(anchor="w")
 
         self.status_var = tk.StringVar(value="실측사진을 불러오세요.  |  휠: 확대/축소  드래그: 이동  더블클릭: 전체보기")
@@ -983,18 +984,41 @@ class BridgeMeasureApp(tk.Tk):
         if not self.roi or len(self.measure_xs) != 5:
             messagebox.showwarning("확인", "먼저 실측영역과 측량점 5개를 지정하세요.")
             return
+
+        # 이미 수동조정된 칸도 다시 조정 가능.
+        # 새 사각형을 드래그 완료하는 순간 기존 영역을 마지막 영역으로 덮어쓴다.
         self.cell_adjust_mode = True
         self.cell_adjust_index = self.selected_cell_index
         self.cell_adjust_start = None
         self.show_cell_regions = True
-        c=self.cell_adjust_index//self.rows; r=self.cell_adjust_index%self.rows
-        self.status_var.set(f"측량점 {c+1} / {r+1}줄 OCR 영역 조정: 사진에서 손글씨 4자리만 포함하도록 사각형을 드래그하세요.")
+        c = self.cell_adjust_index // self.rows
+        r = self.cell_adjust_index % self.rows
+        existed = self.cell_adjust_index in self.custom_cell_rects
+        msg = "재조정" if existed else "조정"
+        self.status_var.set(
+            f"측량점 {c+1} / {r+1}줄 OCR 영역 {msg}: "
+            "사진에서 손글씨 숫자만 포함하도록 새 사각형을 드래그하세요. "
+            "잘못되면 같은 버튼을 눌러 몇 번이든 다시 지정할 수 있습니다."
+        )
         self.redraw_image(self.cell_adjust_index)
 
     def reset_selected_cell_region(self):
-        if self.selected_cell_index is None: return
-        self.custom_cell_rects.pop(self.selected_cell_index, None)
-        self.redraw_image(self.selected_cell_index)
+        if self.selected_cell_index is None:
+            messagebox.showwarning("자동영역 복원", "오른쪽 표에서 먼저 복원할 칸을 클릭하세요.")
+            return
+        idx = self.selected_cell_index
+        c, r = idx // self.rows, idx % self.rows
+        if idx in self.custom_cell_rects:
+            self.custom_cell_rects.pop(idx, None)
+            self.status_var.set(
+                f"측량점 {c+1} / {r+1}줄을 자동 계산 영역으로 복원했습니다."
+            )
+        else:
+            self.status_var.set(
+                f"측량점 {c+1} / {r+1}줄은 이미 자동 계산 영역입니다."
+            )
+        self.show_cell_regions = True
+        self.redraw_image(idx)
 
     def cell_crop_rect(self, c, r):
         """사용자가 찍은 측량점 X와 줄 번호로 '손글씨 한 칸'만 잘라낸다.
@@ -1038,96 +1062,183 @@ class BridgeMeasureApp(tk.Tk):
         if d<=a or e<=b: return None,None
         return self.working_cv[b:e,a:d].copy(), (a,b,d,e)
 
-    def _prep_cell(self, crop, mode=0):
-        """작은 손글씨 칸 전처리. mode 0=대비강조, 1=선 약화."""
+    def _prep_cell_variants(self, crop, manual=False):
+        """한 칸을 여러 방식으로 전처리한다.
+        수동 지정 영역은 위치탐색을 다시 하지 않고 사용자가 그린 사각형 전체를 그대로 사용한다.
+        """
         if crop is None or crop.size == 0:
-            return None
-        h,w = crop.shape[:2]
-        scale = max(2.0, min(4.0, 190.0/max(1,h)))
+            return []
+
+        h, w = crop.shape[:2]
+        # 손글씨가 작으므로 높이 약 220~300px가 되도록 확대
+        scale = max(2.5, min(6.0, 260.0 / max(1, h)))
         up = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
-        g = clahe.apply(gray)
-        if mode == 0:
-            return g
 
-        # 긴 수평/수직 인쇄선을 약화시킨 버전
-        inv = 255 - cv2.adaptiveThreshold(
-            g,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,31,9
+        # 여백을 추가하면 가장자리의 1, 7 같은 가는 숫자를 EasyOCR이 덜 놓친다.
+        pad_y = max(12, int(gray.shape[0] * 0.12))
+        pad_x = max(18, int(gray.shape[1] * 0.10))
+        gray = cv2.copyMakeBorder(gray, pad_y, pad_y, pad_x, pad_x,
+                                  cv2.BORDER_CONSTANT, value=255)
+
+        clahe = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(8, 8))
+        contrast = clahe.apply(gray)
+        blur = cv2.GaussianBlur(contrast, (3, 3), 0)
+
+        variants = [("gray", gray), ("contrast", contrast)]
+
+        # Otsu
+        _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(("otsu", otsu))
+
+        # adaptive
+        adaptive = cv2.adaptiveThreshold(
+            contrast, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 35, 11
         )
-        hk = cv2.getStructuringElement(cv2.MORPH_RECT,(max(30,inv.shape[1]//3),1))
-        vk = cv2.getStructuringElement(cv2.MORPH_RECT,(1,max(35,inv.shape[0]//2)))
-        lines = cv2.bitwise_or(
-            cv2.morphologyEx(inv,cv2.MORPH_OPEN,hk),
-            cv2.morphologyEx(inv,cv2.MORPH_OPEN,vk)
+        variants.append(("adaptive", adaptive))
+
+        # 도면의 긴 수평/수직 인쇄선을 약화한 버전
+        inv = 255 - adaptive
+        hk = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (max(25, inv.shape[1] // 3), 1)
         )
+        vk = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (1, max(28, inv.shape[0] // 2))
+        )
+        hlines = cv2.morphologyEx(inv, cv2.MORPH_OPEN, hk)
+        vlines = cv2.morphologyEx(inv, cv2.MORPH_OPEN, vk)
+        lines = cv2.bitwise_or(hlines, vlines)
         clean = cv2.subtract(inv, lines)
-        return 255-clean
+        line_removed = 255 - clean
+        variants.append(("line_removed", line_removed))
 
-    def _read_cell_once(self, reader, img):
-        if img is None: return []
+        return variants
+
+    def _read_cell_once(self, reader, img, pass_name=""):
+        if img is None:
+            return []
         try:
             res = reader.readtext(
-                np.ascontiguousarray(img), detail=1, paragraph=False,
-                allowlist='0123456789', decoder='greedy', batch_size=1, workers=0,
-                min_size=12, text_threshold=0.28, low_text=0.14,
-                link_threshold=0.18, canvas_size=1280, mag_ratio=1.0,
-                add_margin=0.06
+                np.ascontiguousarray(img),
+                detail=1,
+                paragraph=False,
+                allowlist="0123456789",
+                decoder="greedy",
+                batch_size=1,
+                workers=0,
+                min_size=8,
+                text_threshold=0.18,
+                low_text=0.08,
+                link_threshold=0.12,
+                canvas_size=1600,
+                mag_ratio=1.0,
+                add_margin=0.12
             )
         except Exception:
             return []
-        ih,iw = img.shape[:2]
-        out=[]
-        for box,raw,conf in res:
-            dig=clean_digits(raw)
-            if len(dig)!=4: continue
+
+        ih, iw = img.shape[:2]
+        out = []
+        for item in res:
+            if len(item) < 3:
+                continue
+            box, raw, conf = item[0], str(item[1]), float(item[2])
+            dig = clean_digits(raw)
+
+            # 4자리만 자동후보로 사용
+            if len(dig) != 4:
+                continue
             try:
-                pts=np.asarray(box,dtype=float).reshape(-1,2)
-                bx1,by1=pts[:,0].min(),pts[:,1].min(); bx2,by2=pts[:,0].max(),pts[:,1].max()
-                bw,bh=bx2-bx1,by2-by1
-                if bw < iw*0.12 or bh < ih*0.16 or bh > bw*1.55:
-                    continue
-                cx=(bx1+bx2)/2.0; cy=(by1+by2)/2.0
-                # 칸 중앙 근처 후보 우선
-                dx=abs(cx-iw*0.48)/max(1.0,iw*0.5)
-                dy=abs(cy-ih*0.50)/max(1.0,ih*0.5)
-                score=float(conf)+max(0.0,0.45-0.22*dx-0.30*dy)
-                out.append((dig,float(conf),score))
+                val = int(dig)
             except Exception:
-                pass
+                continue
+            if not (AUTO_MIN_VALUE <= val <= AUTO_MAX_VALUE):
+                continue
+
+            try:
+                pts = np.asarray(box, dtype=float).reshape(-1, 2)
+                bx1, by1 = pts[:, 0].min(), pts[:, 1].min()
+                bx2, by2 = pts[:, 0].max(), pts[:, 1].max()
+                bw, bh = bx2-bx1, by2-by1
+                cx, cy = (bx1+bx2)/2.0, (by1+by2)/2.0
+
+                # 너무 작은 인쇄치수 후보 억제
+                if bw < iw * 0.10 or bh < ih * 0.10:
+                    continue
+
+                dx = abs(cx - iw*0.50) / max(1.0, iw*0.5)
+                dy = abs(cy - ih*0.50) / max(1.0, ih*0.5)
+                center_bonus = max(0.0, 0.30 - 0.12*dx - 0.18*dy)
+                score = conf + center_bonus
+                out.append((dig, conf, score, pass_name))
+            except Exception:
+                continue
         return out
 
     def recognize_one_cell(self, reader, c, r):
-        crop,rect = self.crop_cell_image(c,r)
-        cell=self.empty_cell(); cell['crop_rect']=rect
-        if crop is None: return cell
-
-        # 1차: 빠른 대비강조. 결과가 약할 때만 2차 선제거를 실행한다.
-        cand = self._read_cell_once(reader, self._prep_cell(crop,0))
-        best = max(cand,key=lambda z:z[2]) if cand else None
-        if best is None or best[1] < 0.55:
-            cand2 = self._read_cell_once(reader, self._prep_cell(crop,1))
-            cand += cand2
-            if cand:
-                # 같은 숫자가 두 전처리에서 반복되면 가산점
-                counts={}
-                for d,cf,sc in cand: counts[d]=counts.get(d,0)+1
-                best=max(cand,key=lambda z:(counts[z[0]],z[2],z[1]))
-
-        if not best:
-            cell['status']='확인 필요'
+        idx = c*self.rows + r
+        crop, rect = self.crop_cell_image(c, r)
+        cell = self.empty_cell()
+        cell["crop_rect"] = rect
+        if crop is None:
             return cell
 
-        dig,conf,score=best
-        cell['suggestion']=dig
-        cell['confidence']=conf
-        cell['source']=f'개별칸 OCR 측량점{c+1}/{r+1}줄'
-        # 자동 입력은 보수적으로. 나머지는 suggestion만 남겨 사용자가 확인.
-        if conf >= 0.48:
-            cell['value']=dig
-            cell['status']='자동 인식' if conf >= 0.62 else '확인 필요'
+        manual = idx in self.custom_cell_rects
+        candidates = []
+
+        # 사용자가 초록 박스로 잡은 경우 그 박스 전체를 그대로 여러 전처리로 읽는다.
+        for pass_name, img in self._prep_cell_variants(crop, manual=manual):
+            candidates.extend(self._read_cell_once(reader, img, pass_name))
+
+        if not candidates:
+            cell["status"] = "확인 필요"
+            cell["source"] = "수동영역 다중 OCR 실패" if manual else "자동영역 다중 OCR 실패"
+            return cell
+
+        # 여러 전처리에서 같은 숫자가 반복되면 가장 강하게 채택
+        votes = {}
+        for dig, conf, score, pass_name in candidates:
+            if dig not in votes:
+                votes[dig] = {
+                    "count": 0, "best_conf": 0.0, "best_score": -1.0,
+                    "passes": []
+                }
+            v = votes[dig]
+            v["count"] += 1
+            v["best_conf"] = max(v["best_conf"], conf)
+            v["best_score"] = max(v["best_score"], score)
+            v["passes"].append(pass_name)
+
+        dig, info = max(
+            votes.items(),
+            key=lambda kv: (
+                kv[1]["count"],
+                kv[1]["best_score"],
+                kv[1]["best_conf"]
+            )
+        )
+
+        conf = info["best_conf"]
+        cell["suggestion"] = dig
+        cell["confidence"] = conf
+        cell["source"] = (
+            ("수동영역" if manual else "자동영역")
+            + " 다중OCR:"
+            + ",".join(sorted(set(info["passes"])))
+        )
+
+        # 수동영역은 사용자가 손글씨만 정확히 감쌌다는 전제라 조금 더 적극적으로 입력.
+        # 그래도 4자리/실측범위 필터는 그대로 유지한다.
+        if info["count"] >= 2 or conf >= (0.34 if manual else 0.46):
+            cell["value"] = dig
+            if info["count"] >= 2 and conf >= 0.45:
+                cell["status"] = "자동 인식"
+            else:
+                cell["status"] = "확인 필요"
         else:
-            cell['status']='확인 필요'
+            cell["status"] = "확인 필요"
+
         return cell
 
     def run_ocr(self):
