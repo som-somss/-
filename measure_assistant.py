@@ -67,8 +67,11 @@ class BridgeMeasureApp(tk.Tk):
         self.total = COLS * self.rows
         self.roi = None                 # (x1,y1,x2,y2) - working_cv 원본 좌표
         self.roi_select_mode = False
+        self.roi_adjust_mode = False
         self.roi_start_canvas = None
         self.roi_temp_item = None
+        self.roi_drag_handle = None
+        self.roi_drag_origin = None
 
         # 각 셀: value/conf/status/box/source
         self.cells = [self.empty_cell() for _ in range(self.total)]
@@ -94,6 +97,7 @@ class BridgeMeasureApp(tk.Tk):
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
 
         ttk.Button(toolbar, text="실측영역 지정", command=self.start_roi_selection).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="영역 조정", command=self.start_roi_adjustment).pack(side="left", padx=3)
         ttk.Button(toolbar, text="영역 해제", command=self.clear_roi).pack(side="left", padx=3)
 
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
@@ -157,7 +161,7 @@ class BridgeMeasureApp(tk.Tk):
         legend.pack(fill="both", expand=True, pady=(5, 0))
         ttk.Label(
             legend,
-            text=("• 먼저 [실측영역 지정]을 누르고 사진에서 거더 내측 실측부만 드래그하세요.\n"
+            text=("• 먼저 [실측영역 지정] 후, 필요하면 [영역 조정]으로 테두리/모서리를 드래그해 미세조정하세요.\n"
                   "• OCR은 지정한 사각형 바깥의 숫자를 완전히 무시합니다.\n"
                   "• 줄 수는 상단 +/- 버튼으로 3~15줄까지 바꿀 수 있습니다.\n"
                   "• 손글씨로 판단하기 어려운 값은 빈칸/확인 필요로 둡니다.\n"
@@ -394,15 +398,56 @@ class BridgeMeasureApp(tk.Tk):
             messagebox.showwarning("확인", "먼저 실측사진을 불러오세요.")
             return
         self.roi_select_mode = True
+        self.roi_adjust_mode = False
         self.roi_start_canvas = None
         self.status_var.set("실측영역 지정 중: 거더 내측의 손글씨 실측값 전체가 들어가도록 사각형으로 드래그하세요.")
+
+    def start_roi_adjustment(self):
+        if self.working_cv is None:
+            messagebox.showwarning("확인", "먼저 실측사진을 불러오세요.")
+            return
+        if not self.roi:
+            messagebox.showwarning("확인", "먼저 [실측영역 지정]으로 영역을 지정하세요.")
+            return
+        self.roi_select_mode = False
+        self.roi_adjust_mode = True
+        self.roi_drag_handle = None
+        self.status_var.set("실측영역 조정 중: 분홍색 테두리/모서리를 드래그하세요. 영역 안쪽을 드래그하면 전체 영역이 이동합니다.")
+        self.redraw_image()
 
     def clear_roi(self):
         self.roi = None
         self.roi_select_mode = False
+        self.roi_adjust_mode = False
         self.roi_start_canvas = None
+        self.roi_drag_handle = None
         self.redraw_image()
         self.refresh_grid()
+
+    def _roi_hit_test(self, ix, iy):
+        if not self.roi:
+            return None
+        x1, y1, x2, y2 = self.roi
+        h, w = self.working_cv.shape[:2]
+        tol = max(8.0, min(w, h) * 0.012)
+
+        near_l = abs(ix-x1) <= tol
+        near_r = abs(ix-x2) <= tol
+        near_t = abs(iy-y1) <= tol
+        near_b = abs(iy-y2) <= tol
+        inside_x = x1-tol <= ix <= x2+tol
+        inside_y = y1-tol <= iy <= y2+tol
+
+        if near_l and near_t: return "tl"
+        if near_r and near_t: return "tr"
+        if near_l and near_b: return "bl"
+        if near_r and near_b: return "br"
+        if near_l and inside_y: return "l"
+        if near_r and inside_y: return "r"
+        if near_t and inside_x: return "t"
+        if near_b and inside_x: return "b"
+        if x1 < ix < x2 and y1 < iy < y2: return "move"
+        return None
 
     def on_canvas_left_down(self, event):
         if self.roi_select_mode:
@@ -410,6 +455,11 @@ class BridgeMeasureApp(tk.Tk):
             if self.roi_temp_item:
                 self.image_canvas.delete(self.roi_temp_item)
                 self.roi_temp_item = None
+        elif self.roi_adjust_mode and self.roi:
+            p = self.canvas_to_image(event.x, event.y)
+            if p:
+                self.roi_drag_handle = self._roi_hit_test(*p)
+                self.roi_drag_origin = (p[0], p[1], self.roi)
         else:
             self.drag_start = (event.x, event.y, self.offset_x, self.offset_y)
 
@@ -421,6 +471,29 @@ class BridgeMeasureApp(tk.Tk):
             self.roi_temp_item = self.image_canvas.create_rectangle(
                 x0, y0, event.x, event.y, outline="#ff00aa", width=3
             )
+        elif self.roi_adjust_mode and self.roi_drag_handle and self.roi_drag_origin:
+            p = self.canvas_to_image(event.x, event.y)
+            if not p:
+                return
+            ix, iy = p
+            sx, sy, old = self.roi_drag_origin
+            x1, y1, x2, y2 = old
+            h, w = self.working_cv.shape[:2]
+            dx, dy = ix-sx, iy-sy
+            handle = self.roi_drag_handle
+
+            if handle == "move":
+                ww, hh = x2-x1, y2-y1
+                nx1 = max(0.0, min(w-ww, x1+dx))
+                ny1 = max(0.0, min(h-hh, y1+dy))
+                self.roi = (nx1, ny1, nx1+ww, ny1+hh)
+            else:
+                if "l" in handle: x1 = max(0.0, min(x2-10.0, ix))
+                if "r" in handle: x2 = min(float(w-1), max(x1+10.0, ix))
+                if "t" in handle: y1 = max(0.0, min(y2-10.0, iy))
+                if "b" in handle: y2 = min(float(h-1), max(y1+10.0, iy))
+                self.roi = (x1, y1, x2, y2)
+            self.redraw_image()
         elif self.drag_start:
             sx, sy, ox, oy = self.drag_start
             self.offset_x = ox + (event.x - sx)
@@ -450,6 +523,18 @@ class BridgeMeasureApp(tk.Tk):
                     self.row_centers = None
                     self.refresh_grid()
             self.redraw_image()
+
+        elif self.roi_adjust_mode and self.roi_drag_handle:
+            self.roi_drag_handle = None
+            self.roi_drag_origin = None
+            # 영역을 바꾸면 기존 OCR 배치는 더 이상 좌표가 맞지 않으므로 초기화
+            self.cells = [self.empty_cell() for _ in range(self.total)]
+            self.col_centers = None
+            self.row_centers = None
+            self.refresh_grid()
+            self.redraw_image()
+            self.status_var.set("실측영역 조정 완료. [숫자 자동인식(OCR)]을 다시 실행하세요.")
+
         self.drag_start = None
 
     # --------------------------------------------------------- OCR
@@ -567,81 +652,99 @@ class BridgeMeasureApp(tk.Tk):
 
     def infer_grid_and_assign(self, candidates):
         """
-        지정한 실측영역을 정확히 5개 측량점 열 × N개 줄로 나눈 뒤,
-        각 OCR 숫자를 '가장 가까운 칸'에만 넣는다.
-
-        중요:
-        이전 버전처럼 OCR 숫자의 X좌표를 다시 군집화해서 측량점 열을 만들지 않는다.
-        숫자가 일부 누락되면 측량점1 숫자가 측량점2 열의 중심으로 오인되는 문제가 있었기 때문이다.
+        열(측량점)은 ROI를 정확히 5등분해서 고정한다.
+        행(1~N줄)은 ROI를 균등분할하지 않고, 손글씨 OCR 후보들의 Y좌표를 군집화하여
+        실제 실측 숫자가 놓인 가로 라인을 따라간다.
         """
         if not self.roi:
             raise RuntimeError("실측영역이 지정되지 않았습니다.")
 
         x1, y1, x2, y2 = self.roi
-        rw, rh = x2 - x1, y2 - y1
+        rw, rh = x2-x1, y2-y1
 
-        # 사용자가 지정한 영역 자체를 5열 × N행으로 고정 분할한다.
-        # 따라서 OCR 누락 여부와 관계없이 측량점1~5의 경계가 절대로 서로 이동하지 않는다.
-        col_edges = [x1 + rw * i / COLS for i in range(COLS + 1)]
-        row_edges = [y1 + rh * i / self.rows for i in range(self.rows + 1)]
-        col_centers = [(col_edges[i] + col_edges[i+1]) / 2.0 for i in range(COLS)]
-        row_centers = [(row_edges[i] + row_edges[i+1]) / 2.0 for i in range(self.rows)]
+        col_edges = [x1 + rw*i/COLS for i in range(COLS+1)]
+        col_centers = [(col_edges[i]+col_edges[i+1])/2.0 for i in range(COLS)]
 
-        # 영역 내부 후보만 사용
-        core = [
-            it for it in candidates
-            if x1 <= it["x"] <= x2 and y1 <= it["y"] <= y2
-        ]
-
-        # 손글씨는 대체로 인쇄 치수보다 크므로 높이 기준은 보조 점수로만 사용한다.
+        core = [it for it in candidates if x1 <= it["x"] <= x2 and y1 <= it["y"] <= y2]
         heights = sorted(it["h"] for it in core if it["h"] > 0)
-        med_h = heights[len(heights)//2] if heights else max(1.0, rh / self.rows * 0.18)
+        med_h = heights[len(heights)//2] if heights else max(1.0, rh/self.rows*0.18)
+
+        # 손글씨 후보: 4자리 실측값 + 상대적으로 큰 글자 위주.
+        # 인쇄된 600/358 등의 작은 치수는 행 중심 계산에서 제외한다.
+        handwriting = []
+        for it in core:
+            sval = str(it["value"]).strip()
+            if len(sval) == 4 and it["h"] >= med_h*0.80:
+                handwriting.append(it)
+
+        # 충분한 손글씨 후보가 있으면 실제 Y 위치로 N개 행 중심을 계산한다.
+        ys = [it["y"] for it in handwriting]
+        detected_rows = self.cluster_1d(ys, self.rows) if len(ys) >= self.rows else None
+
+        if detected_rows and len(detected_rows) == self.rows:
+            row_centers = sorted(detected_rows)
+        else:
+            # OCR이 너무 부족한 경우에만 ROI 균등분할을 fallback으로 사용
+            row_centers = [y1 + rh*(i+0.5)/self.rows for i in range(self.rows)]
+
+        # 행 경계는 인접한 실제 행 중심의 중간점
+        row_edges = [y1]
+        for i in range(self.rows-1):
+            row_edges.append((row_centers[i]+row_centers[i+1])/2.0)
+        row_edges.append(y2)
 
         cells = [self.empty_cell() for _ in range(self.total)]
-        best_scores = [-1e9] * self.total
+        best_scores = [-1e9]*self.total
 
         for it in core:
-            # 이 숫자가 실제로 어느 5열/N행 안에 들어있는지 먼저 확정한다.
-            c = int((it["x"] - x1) / max(1e-9, rw) * COLS)
-            r = int((it["y"] - y1) / max(1e-9, rh) * self.rows)
-            c = max(0, min(COLS - 1, c))
-            r = max(0, min(self.rows - 1, r))
+            sval = str(it["value"]).strip()
+
+            # CAD에 쓸 실측값은 우선 4자리 숫자만 배치.
+            # 3자리 인쇄 치수(600 등)와 5자리 오인식은 표 자동입력에서 제외.
+            if len(sval) != 4:
+                continue
+
+            # X는 고정 5열 중 실제 포함된 열로 결정
+            c = int((it["x"]-x1)/max(1e-9, rw)*COLS)
+            c = max(0, min(COLS-1, c))
+
+            # Y는 '균등 칸'이 아니라 가장 가까운 실제 실측 행 중심으로 결정
+            r = min(range(self.rows), key=lambda k: abs(it["y"]-row_centers[k]))
 
             left, right = col_edges[c], col_edges[c+1]
-            top, bottom = row_edges[r], row_edges[r+1]
-            cell_w = max(1.0, right - left)
-            cell_h = max(1.0, bottom - top)
-            cx0, cy0 = col_centers[c], row_centers[r]
+            cell_w = max(1.0, right-left)
 
-            # 칸 중심과의 거리. 칸 경계를 넘은 숫자는 다른 측량점으로 절대 이동하지 않는다.
-            dx = abs(it["x"] - cx0) / (cell_w / 2.0)
-            dy = abs(it["y"] - cy0) / (cell_h / 2.0)
+            # 인접 행 간격의 약 42%를 넘게 벗어나면 억지 배치하지 않음
+            if self.rows > 1:
+                neighbor_gaps = []
+                if r > 0:
+                    neighbor_gaps.append(row_centers[r]-row_centers[r-1])
+                if r < self.rows-1:
+                    neighbor_gaps.append(row_centers[r+1]-row_centers[r])
+                row_tol = max(12.0, min(neighbor_gaps)*0.42) if neighbor_gaps else rh/self.rows*0.42
+            else:
+                row_tol = rh*0.42
 
-            # 경계에 너무 붙은 숫자는 인쇄 치수/옆 칸 숫자일 가능성이 높아 감점한다.
-            edge_margin_x = min(it["x"] - left, right - it["x"]) / cell_w
-            edge_margin_y = min(it["y"] - top, bottom - it["y"]) / cell_h
+            dy_abs = abs(it["y"]-row_centers[r])
+            if dy_abs > row_tol:
+                continue
 
-            pos_score = max(0.0, 1.0 - 0.55 * dx * dx - 0.75 * dy * dy)
-            size_score = min(1.8, it["h"] / max(1.0, med_h))
+            dx = abs(it["x"]-col_centers[c])/(cell_w/2.0)
+            dy = dy_abs/max(1.0, row_tol)
+            size_score = min(1.8, it["h"]/max(1.0, med_h))
             conf_score = max(0.0, min(1.0, it["confidence"]))
+            pos_score = max(0.0, 1.0 - 0.35*dx*dx - 0.85*dy*dy)
+            score = 1.45*pos_score + 1.00*size_score + 0.55*conf_score
 
-            edge_penalty = 0.0
-            if edge_margin_x < 0.06:
-                edge_penalty += 0.45
-            if edge_margin_y < 0.04:
-                edge_penalty += 0.25
-
-            score = 1.55 * pos_score + 0.95 * size_score + 0.55 * conf_score - edge_penalty
-
-            idx = c * self.rows + r
+            idx = c*self.rows+r
             if score > best_scores[idx]:
                 best_scores[idx] = score
-                status = "자동 인식" if conf_score >= 0.55 and score >= 2.15 else "확인 필요"
+                status = "자동 인식" if conf_score >= 0.55 and score >= 2.10 else "확인 필요"
                 cells[idx] = {
-                    "value": str(it["value"]),
+                    "value": sval,
                     "confidence": it["confidence"],
                     "status": status,
-                    "box": it["box"],
+                    "box": it["box"],       # 실제 OCR 숫자의 박스를 그대로 보존
                     "source": it["raw"]
                 }
 
