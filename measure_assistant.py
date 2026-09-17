@@ -923,52 +923,84 @@ class BridgeMeasureApp(tk.Tk):
         return cells, col_centers, row_centers
 
     def cell_crop_rect(self, c, r):
-        if not self.roi:
+        """사용자가 찍은 측량점 X와 줄 번호로 '손글씨 한 칸'만 잘라낸다.
+        핵심: 측량점 사이 전체 폭을 쓰지 않고 파란 기준선 주변의 좁은 영역만 사용한다.
+        손글씨가 기준선의 왼쪽에 놓이는 현장 도면 특성을 반영해 왼쪽을 더 넓게 잡는다.
+        """
+        if not self.roi or len(self.measure_xs) != 5:
             return None
-        x1,y1,x2,y2=self.roi
-        rw=x2-x1
-        cols=self.col_centers or [x1+rw*(i+0.5)/COLS for i in range(COLS)]
-        rows=self.row_centers or [y1+(y2-y1)*(i+0.5)/self.rows for i in range(self.rows)]
-        xe=[x1]+[(cols[i]+cols[i+1])/2.0 for i in range(COLS-1)]+[x2]
-        ye=[y1]+[(rows[i]+rows[i+1])/2.0 for i in range(self.rows-1)]+[y2]
-        lx,rx=xe[c],xe[c+1]; ty,by=ye[r],ye[r+1]
-        # 각 칸의 경계 치수선을 줄이기 위해 안쪽으로 약간 축소
-        mx=(rx-lx)*0.08; my=(by-ty)*0.08
-        return lx+mx,ty+my,rx-mx,by-my
+        x1, y1, x2, y2 = self.roi
+        xs = sorted(self.measure_xs)
+        rw, rh = x2-x1, y2-y1
+        row_h = rh / max(1, self.rows)
+        cy = y1 + (r + 0.5) * row_h
 
-    def crop_cell_image(self,c,r):
-        rect=self.cell_crop_rect(c,r)
+        # 측량점 간격을 이용해 안전한 검색 폭 결정
+        gaps = [xs[i+1]-xs[i] for i in range(4) if xs[i+1] > xs[i]]
+        gap = min(gaps) if gaps else rw/5.0
+        # 전체 열 폭의 일부만 사용. 인접 측량점/인쇄 치수 침범 방지
+        win = min(gap*0.34, rw*0.075)
+        win = max(win, 42.0)
+
+        # 손글씨는 파란 기준선의 왼쪽에 있는 경우가 많으므로 좌측 78%, 우측 22%
+        lx = xs[c] - win*0.78
+        rx = xs[c] + win*0.22
+        # 행 경계의 인쇄선/치수선이 덜 들어오도록 높이도 축소
+        ty = cy - row_h*0.31
+        by = cy + row_h*0.31
+
+        return max(x1,lx), max(y1,ty), min(x2,rx), min(y2,by)
+
+    def crop_cell_image(self, c, r):
+        rect = self.cell_crop_rect(c,r)
         if not rect: return None,None
-        x1,y1,x2,y2=rect
-        h,w=self.working_cv.shape[:2]
-        a,b=max(0,int(x1)),max(0,int(y1)); d,e=min(w,int(x2)),min(h,int(y2))
+        x1,y1,x2,y2 = rect
+        h,w = self.working_cv.shape[:2]
+        a,b = max(0,int(x1)), max(0,int(y1))
+        d,e = min(w,int(x2)), min(h,int(y2))
         if d<=a or e<=b: return None,None
-        return self.working_cv[b:e,a:d].copy(),(a,b,d,e)
+        return self.working_cv[b:e,a:d].copy(), (a,b,d,e)
 
-    def cell_variants(self,crop):
-        if crop is None or crop.size==0: return []
-        h,w=crop.shape[:2]
-        s=max(2.0,240.0/max(1,h))
-        up=cv2.resize(crop,None,fx=s,fy=s,interpolation=cv2.INTER_CUBIC)
-        gray=cv2.cvtColor(up,cv2.COLOR_BGR2GRAY)
-        clahe=cv2.createCLAHE(clipLimit=2.4,tileGridSize=(8,8))
-        con=clahe.apply(gray)
-        blur=cv2.GaussianBlur(con,(3,3),0)
-        _,otsu=cv2.threshold(blur,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        ada=cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,31,11)
-        inv=255-ada
-        hk=cv2.getStructuringElement(cv2.MORPH_RECT,(max(25,inv.shape[1]//7),1))
-        vk=cv2.getStructuringElement(cv2.MORPH_RECT,(1,max(25,inv.shape[0]//3)))
-        lines=cv2.bitwise_or(cv2.morphologyEx(inv,cv2.MORPH_OPEN,hk),cv2.morphologyEx(inv,cv2.MORPH_OPEN,vk))
-        clean=255-cv2.subtract(inv,lines)
-        return [('원본확대',up),('대비강조',con),('Otsu',otsu),('선제거',clean)]
+    def _prep_cell(self, crop, mode=0):
+        """작은 손글씨 칸 전처리. mode 0=대비강조, 1=선 약화."""
+        if crop is None or crop.size == 0:
+            return None
+        h,w = crop.shape[:2]
+        scale = max(2.0, min(4.0, 190.0/max(1,h)))
+        up = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+        g = clahe.apply(gray)
+        if mode == 0:
+            return g
 
-    def ocr_cell_variant(self,reader,img,name):
+        # 긴 수평/수직 인쇄선을 약화시킨 버전
+        inv = 255 - cv2.adaptiveThreshold(
+            g,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,31,9
+        )
+        hk = cv2.getStructuringElement(cv2.MORPH_RECT,(max(30,inv.shape[1]//3),1))
+        vk = cv2.getStructuringElement(cv2.MORPH_RECT,(1,max(35,inv.shape[0]//2)))
+        lines = cv2.bitwise_or(
+            cv2.morphologyEx(inv,cv2.MORPH_OPEN,hk),
+            cv2.morphologyEx(inv,cv2.MORPH_OPEN,vk)
+        )
+        clean = cv2.subtract(inv, lines)
+        return 255-clean
+
+    def _read_cell_once(self, reader, img):
+        if img is None: return []
         try:
-            res=reader.readtext(np.ascontiguousarray(img),detail=1,paragraph=False,allowlist='0123456789',decoder='greedy',min_size=12,text_threshold=0.30,low_text=0.15,link_threshold=0.20,canvas_size=2560,mag_ratio=1.5,add_margin=0.08)
+            res = reader.readtext(
+                np.ascontiguousarray(img), detail=1, paragraph=False,
+                allowlist='0123456789', decoder='greedy', batch_size=1, workers=0,
+                min_size=12, text_threshold=0.28, low_text=0.14,
+                link_threshold=0.18, canvas_size=1280, mag_ratio=1.0,
+                add_margin=0.06
+            )
         except Exception:
             return []
-        ih,iw=img.shape[:2]; out=[]
+        ih,iw = img.shape[:2]
+        out=[]
         for box,raw,conf in res:
             dig=clean_digits(raw)
             if len(dig)!=4: continue
@@ -976,29 +1008,47 @@ class BridgeMeasureApp(tk.Tk):
                 pts=np.asarray(box,dtype=float).reshape(-1,2)
                 bx1,by1=pts[:,0].min(),pts[:,1].min(); bx2,by2=pts[:,0].max(),pts[:,1].max()
                 bw,bh=bx2-bx1,by2-by1
-                if bh<ih*0.10 or bw<iw*0.07 or bh>bw*1.45: continue
-                cx,cy=(bx1+bx2)/2,(by1+by2)/2
-                dx=abs(cx-iw/2)/max(1,iw/2); dy=abs(cy-ih/2)/max(1,ih/2)
-                center=max(0.0,1.0-0.45*dx-0.70*dy)
-                out.append((dig,float(conf),float(conf)*1.4+center,name))
-            except Exception: pass
+                if bw < iw*0.12 or bh < ih*0.16 or bh > bw*1.55:
+                    continue
+                cx=(bx1+bx2)/2.0; cy=(by1+by2)/2.0
+                # 칸 중앙 근처 후보 우선
+                dx=abs(cx-iw*0.48)/max(1.0,iw*0.5)
+                dy=abs(cy-ih*0.50)/max(1.0,ih*0.5)
+                score=float(conf)+max(0.0,0.45-0.22*dx-0.30*dy)
+                out.append((dig,float(conf),score))
+            except Exception:
+                pass
         return out
 
-    def recognize_one_cell(self,reader,c,r):
-        crop,rect=self.crop_cell_image(c,r)
+    def recognize_one_cell(self, reader, c, r):
+        crop,rect = self.crop_cell_image(c,r)
         cell=self.empty_cell(); cell['crop_rect']=rect
         if crop is None: return cell
-        votes={}
-        for name,img in self.cell_variants(crop):
-            for dig,conf,score,vname in self.ocr_cell_variant(reader,img,name):
-                z=votes.setdefault(dig,{'n':0,'score':0.0,'conf':0.0,'src':[]})
-                z['n']+=1; z['score']+=score; z['conf']=max(z['conf'],conf); z['src'].append(vname)
-        if not votes: return cell
-        dig,z=max(votes.items(),key=lambda kv:(kv[1]['n'],kv[1]['score'],kv[1]['conf']))
-        cell['suggestion']=dig; cell['confidence']=z['conf']; cell['source']='/'.join(z['src'])
-        # 서로 다른 전처리에서 2회 이상 같은 값이 나온 경우 위주로 자동입력
-        if z['n']>=2 or (z['conf']>=0.82 and z['score']>=1.70):
-            cell['value']=dig; cell['status']='자동 인식'
+
+        # 1차: 빠른 대비강조. 결과가 약할 때만 2차 선제거를 실행한다.
+        cand = self._read_cell_once(reader, self._prep_cell(crop,0))
+        best = max(cand,key=lambda z:z[2]) if cand else None
+        if best is None or best[1] < 0.55:
+            cand2 = self._read_cell_once(reader, self._prep_cell(crop,1))
+            cand += cand2
+            if cand:
+                # 같은 숫자가 두 전처리에서 반복되면 가산점
+                counts={}
+                for d,cf,sc in cand: counts[d]=counts.get(d,0)+1
+                best=max(cand,key=lambda z:(counts[z[0]],z[2],z[1]))
+
+        if not best:
+            cell['status']='확인 필요'
+            return cell
+
+        dig,conf,score=best
+        cell['suggestion']=dig
+        cell['confidence']=conf
+        cell['source']=f'개별칸 OCR 측량점{c+1}/{r+1}줄'
+        # 자동 입력은 보수적으로. 나머지는 suggestion만 남겨 사용자가 확인.
+        if conf >= 0.48:
+            cell['value']=dig
+            cell['status']='자동 인식' if conf >= 0.62 else '확인 필요'
         else:
             cell['status']='확인 필요'
         return cell
@@ -1017,33 +1067,40 @@ class BridgeMeasureApp(tk.Tk):
             )
             return
         try:
-            reader = self.get_reader()
-            all_cells = []
+            reader=self.get_reader()
+            self.col_centers=sorted(self.measure_xs)
+            x1,y1,x2,y2=self.roi
+            self.row_centers=[y1+(r+0.5)*(y2-y1)/self.rows for r in range(self.rows)]
+            self.cells=[self.empty_cell() for _ in range(self.total)]
+
+            n=0
             for c in range(5):
-                self.status_var.set(f"빠른 OCR {c+1}/5 | 측량점 {c+1} 세로열 인식 중...")
-                self.update_idletasks()
-                strip_cells = self._recognize_strip(reader, c)
-                all_cells.extend(strip_cells)
+                for r in range(self.rows):
+                    n+=1
+                    self.status_var.set(
+                        f"개별 칸 OCR {n}/{self.total} | 측량점 {c+1} / {r+1}줄"
+                    )
+                    self.update_idletasks()
+                    self.cells[c*self.rows+r]=self.recognize_one_cell(reader,c,r)
+                    # 진행 중에도 표를 갱신해서 멈춘 것처럼 보이지 않게 함
+                    if n % 3 == 0 or n == self.total:
+                        self.refresh_grid()
+                        self.redraw_image()
 
-            self.cells = all_cells
-            x1,y1,x2,y2 = self.roi
-            self.col_centers = sorted(self.measure_xs)
-            self.row_centers = [y1+(r+0.5)*(y2-y1)/self.rows for r in range(self.rows)]
-            self.refresh_grid()
-            self.redraw_image()
-
-            done = sum(1 for x in self.cells if str(x.get("value","")).strip())
+            self.refresh_grid(); self.redraw_image()
+            done=sum(1 for x in self.cells if str(x.get('value','')).strip())
             self.status_var.set(
-                f"빠른 OCR 완료 | 자동입력 {done}/{self.total}개 | 측량점 위치 기준으로 행 배치"
+                f"개별 칸 OCR 완료 | 자동/후보 {done}/{self.total}개 | 5개 측량점 × {self.rows}줄"
             )
             messagebox.showinfo(
                 "OCR 완료",
-                f"측량점 세로열 5개만 OCR했습니다.\n자동 입력: {done}/{self.total}개\n\n"
-                "이번 버전은 OCR 속도와 '다른 측량점으로 값이 넘어가는 문제'를 우선 개선한 테스트 버전입니다."
+                f"5개 측량점 × {self.rows}줄 = {self.total}개 칸을 각각 인식했습니다.\n"
+                f"표에 들어온 값: {done}/{self.total}개\n\n"
+                "빈칸/오인식은 표를 더블클릭해 수정해주세요."
             )
         except Exception as e:
-            p = self.save_error_log(traceback.format_exc())
-            messagebox.showerror("OCR 실행 오류", f"OCR 처리 중 오류가 발생했습니다.\n\n{e}\n\n상세 오류: {p or '-'}")
+            p=self.save_error_log(traceback.format_exc())
+            messagebox.showerror("OCR 실행 오류",f"OCR 처리 중 오류가 발생했습니다.\n\n{e}\n\n상세 오류: {p or '-'}")
 
     # --------------------------------------------------------- 표 선택/편집
     def tree_cell_from_event(self, event):
