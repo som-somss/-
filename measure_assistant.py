@@ -86,6 +86,10 @@ class BridgeMeasureApp(tk.Tk):
         self.col_centers = None
         self.row_centers = None
 
+        # 측량점 X 위치 지정 상태
+        self.measure_xs = []
+        self.measure_pick_mode = False
+
         self.create_ui()
         self.reset_grid()
 
@@ -116,6 +120,7 @@ class BridgeMeasureApp(tk.Tk):
         ttk.Button(toolbar, text="＋", width=3, command=lambda: self.change_rows(1)).pack(side="left", padx=1)
 
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(toolbar, text="측량점 5개 지정", command=self.start_measure_points).pack(side="left", padx=3)
         ttk.Button(toolbar, text="숫자 자동인식(OCR)", command=self.run_ocr).pack(side="left", padx=3)
         ttk.Button(toolbar, text="표 비우기", command=self.clear_values).pack(side="left", padx=3)
         ttk.Button(toolbar, text="CSV 저장", command=self.save_csv).pack(side="right", padx=3)
@@ -125,7 +130,7 @@ class BridgeMeasureApp(tk.Tk):
         ttk.Label(
             guide,
             text=("1) 사진 불러오기 → 2) 방향 확인/회전 → 3) 줄 수 설정 → 4) 실측영역 지정 → "
-                  "5) OCR → 6) 표와 사진 대조/수정 → 7) CSV 저장 → 8) CADian에서 MEASUREAUTO 실행")
+                  "5) 측량점 5개 지정 → 6) OCR → 7) 표와 사진 대조/수정 → 8) CSV 저장 → 9) CADian에서 MEASUREAUTO 실행")
         ).pack(anchor="w")
 
         self.status_var = tk.StringVar(value="실측사진을 불러오세요.  |  휠: 확대/축소  드래그: 이동  더블클릭: 전체보기")
@@ -277,6 +282,8 @@ class BridgeMeasureApp(tk.Tk):
             self.col_centers = None
             self.row_centers = None
             self.roi = None
+            self.measure_xs = []
+            self.measure_pick_mode = False
             self.refresh_grid()
             self.after(50, self.fit_image)
         except Exception as e:
@@ -297,6 +304,8 @@ class BridgeMeasureApp(tk.Tk):
         self.col_centers = None
         self.row_centers = None
         self.roi = None
+        self.measure_xs = []
+        self.measure_pick_mode = False
         self.refresh_grid()
         self.after(30, self.fit_image)
 
@@ -343,6 +352,18 @@ class BridgeMeasureApp(tk.Tk):
             if self.roi:
                 rx1, ry1, rx2, ry2 = self.roi
                 self.draw_source_rect(rx1, ry1, rx2, ry2, cx, cy, w, h, scale, width=2)
+
+            # 사용자가 지정한 측량점 X 위치를 세로 기준선 + 번호로 표시
+            if getattr(self, "measure_xs", None):
+                rx1, ry1, rx2, ry2 = self.roi if self.roi else (0, 0, w-1, h-1)
+                left = cx - w * scale / 2
+                top = cy - h * scale / 2
+                for i, mx in enumerate(sorted(self.measure_xs), 1):
+                    X = left + mx * scale
+                    Y1 = top + ry1 * scale
+                    Y2 = top + ry2 * scale
+                    self.image_canvas.create_line(X, Y1, X, Y2, fill="#00c8ff", width=2, dash=(5, 3))
+                    self.image_canvas.create_text(X + 7, Y1 + 14, text=str(i), fill="#00c8ff", anchor="w", font=("Arial", 11, "bold"))
 
             # OCR 박스 또는 추정 셀 위치 표시
             if selected_index is not None and 0 <= selected_index < self.total:
@@ -429,6 +450,8 @@ class BridgeMeasureApp(tk.Tk):
         self.roi_adjust_mode = False
         self.roi_start_canvas = None
         self.roi_drag_handle = None
+        self.measure_xs = []
+        self.measure_pick_mode = False
         self.redraw_image()
         self.refresh_grid()
 
@@ -458,6 +481,10 @@ class BridgeMeasureApp(tk.Tk):
         return None
 
     def on_canvas_left_down(self, event):
+        # 측량점 지정 모드에서는 일반 드래그보다 클릭 지정을 우선한다.
+        if getattr(self, "measure_pick_mode", False):
+            self._handle_measure_point_click(event)
+            return
         if self.roi_select_mode:
             self.roi_start_canvas = (event.x, event.y)
             if self.roi_temp_item:
@@ -529,8 +556,12 @@ class BridgeMeasureApp(tk.Tk):
                     self.cells = [self.empty_cell() for _ in range(self.total)]
                     self.col_centers = None
                     self.row_centers = None
+                    self.measure_xs = []
+                    self.measure_pick_mode = False
                     self.refresh_grid()
             self.redraw_image()
+            if self.roi:
+                self.status_var.set("실측영역 지정 완료. 이제 [측량점 5개 지정]을 누르세요.")
 
         elif self.roi_adjust_mode and self.roi_drag_handle:
             self.roi_drag_handle = None
@@ -539,9 +570,11 @@ class BridgeMeasureApp(tk.Tk):
             self.cells = [self.empty_cell() for _ in range(self.total)]
             self.col_centers = None
             self.row_centers = None
+            self.measure_xs = []
+            self.measure_pick_mode = False
             self.refresh_grid()
             self.redraw_image()
-            self.status_var.set("실측영역 조정 완료. [숫자 자동인식(OCR)]을 다시 실행하세요.")
+            self.status_var.set("실측영역 조정 완료. [측량점 5개 지정] 후 [숫자 자동인식(OCR)]을 실행하세요.")
 
         self.drag_start = None
 
@@ -559,18 +592,9 @@ class BridgeMeasureApp(tk.Tk):
         self.redraw_image()
 
     def _canvas_to_image(self, event):
-        # 기존 표시 파라미터가 있으면 사용하고, 없으면 현재 canvas/image 크기로 환산
+        """현재 확대/이동 상태를 반영하여 캔버스 클릭을 원본 이미지 좌표로 변환."""
         try:
-            cw = max(1, self.canvas.winfo_width())
-            ch = max(1, self.canvas.winfo_height())
-            ih, iw = self.working_cv.shape[:2]
-            scale = min(cw/iw, ch/ih) * self.zoom
-            dw, dh = iw*scale, ih*scale
-            ox = (cw-dw)/2 + getattr(self, "pan_x", 0)
-            oy = (ch-dh)/2 + getattr(self, "pan_y", 0)
-            x = (event.x-ox)/scale
-            y = (event.y-oy)/scale
-            return x, y
+            return self.canvas_to_image(event.x, event.y)
         except Exception:
             return None, None
 
@@ -997,7 +1021,7 @@ class BridgeMeasureApp(tk.Tk):
             all_cells = []
             for c in range(5):
                 self.status_var.set(f"빠른 OCR {c+1}/5 | 측량점 {c+1} 세로열 인식 중...")
-                self.root.update_idletasks()
+                self.update_idletasks()
                 strip_cells = self._recognize_strip(reader, c)
                 all_cells.extend(strip_cells)
 
@@ -1018,8 +1042,8 @@ class BridgeMeasureApp(tk.Tk):
                 "이번 버전은 OCR 속도와 '다른 측량점으로 값이 넘어가는 문제'를 우선 개선한 테스트 버전입니다."
             )
         except Exception as e:
-            self.log_error(e)
-            messagebox.showerror("OCR 실행 오류", f"OCR 처리 중 오류가 발생했습니다.\n\n{e}")
+            p = self.save_error_log(traceback.format_exc())
+            messagebox.showerror("OCR 실행 오류", f"OCR 처리 중 오류가 발생했습니다.\n\n{e}\n\n상세 오류: {p or '-'}")
 
     # --------------------------------------------------------- 표 선택/편집
     def tree_cell_from_event(self, event):
