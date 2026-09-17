@@ -1,50 +1,64 @@
 # -*- coding: utf-8 -*-
 
 import csv
+import os
 import re
-import traceback
 import sys
+import traceback
 from pathlib import Path
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-
 # ============================================================
-# OCR 모듈 확인
+# 외부 모듈
 # ============================================================
 
 OCR_AVAILABLE = False
-OCR_ERROR = ""
+OCR_IMPORT_ERROR = ""
 
 try:
+    import cv2
+    import numpy as np
+    from PIL import Image, ImageTk
     import easyocr
+
     OCR_AVAILABLE = True
 
 except Exception:
-    OCR_ERROR = traceback.format_exc()
+    OCR_IMPORT_ERROR = traceback.format_exc()
 
 
 # ============================================================
-# 메인 프로그램
+# 프로그램
 # ============================================================
 
-class App(tk.Tk):
+class BridgeMeasureApp(tk.Tk):
 
     def __init__(self):
 
         super().__init__()
 
-        self.title("교량 실측 CAD 자동작성 - 테스트")
-        self.geometry("880x650")
+        self.title("교량 실측 CAD 자동작성")
+        self.geometry("1400x820")
+        self.minsize(1100, 650)
 
         self.image_path = None
+
+        self.original_cv = None
+        self.working_cv = None
+
+        self.preview_photo = None
+
         self.reader = None
+
+        self.ocr_items = []
 
         self.create_ui()
 
 
     # ========================================================
-    # UI 생성
+    # UI
     # ========================================================
 
     def create_ui(self):
@@ -53,139 +67,248 @@ class App(tk.Tk):
         # 상단 버튼
         # ----------------------------------------------------
 
-        top = ttk.Frame(
+        toolbar = ttk.Frame(
             self,
-            padding=10
+            padding=8
         )
 
-        top.pack(
+        toolbar.pack(
             fill="x"
         )
 
 
         ttk.Button(
-            top,
+            toolbar,
             text="실측사진 불러오기",
             command=self.load_image
         ).pack(
             side="left",
-            padx=4
+            padx=3
         )
 
 
         ttk.Button(
-            top,
+            toolbar,
+            text="왼쪽 90°",
+            command=lambda: self.rotate_image(90)
+        ).pack(
+            side="left",
+            padx=3
+        )
+
+
+        ttk.Button(
+            toolbar,
+            text="오른쪽 90°",
+            command=lambda: self.rotate_image(-90)
+        ).pack(
+            side="left",
+            padx=3
+        )
+
+
+        ttk.Button(
+            toolbar,
+            text="180°",
+            command=lambda: self.rotate_image(180)
+        ).pack(
+            side="left",
+            padx=3
+        )
+
+
+        ttk.Separator(
+            toolbar,
+            orient="vertical"
+        ).pack(
+            side="left",
+            fill="y",
+            padx=8
+        )
+
+
+        ttk.Button(
+            toolbar,
             text="숫자 자동인식(OCR)",
             command=self.run_ocr
         ).pack(
             side="left",
-            padx=4
+            padx=3
         )
 
 
         ttk.Button(
-            top,
+            toolbar,
             text="행 추가",
             command=self.add_row
         ).pack(
             side="left",
-            padx=4
+            padx=3
         )
 
 
         ttk.Button(
-            top,
+            toolbar,
             text="선택 행 삭제",
-            command=self.delete_row
+            command=self.delete_selected_rows
         ).pack(
             side="left",
-            padx=4
+            padx=3
         )
 
 
         ttk.Button(
-            top,
+            toolbar,
             text="CSV 저장",
             command=self.save_csv
         ).pack(
             side="right",
-            padx=4
+            padx=3
         )
 
 
         # ----------------------------------------------------
-        # 사용 순서
+        # 안내
         # ----------------------------------------------------
 
-        info = ttk.LabelFrame(
+        guide = ttk.LabelFrame(
             self,
             text="사용 순서",
-            padding=10
+            padding=7
         )
 
-        info.pack(
+        guide.pack(
             fill="x",
-            padx=10,
-            pady=(0, 10)
+            padx=8,
+            pady=(0, 5)
         )
 
 
         ttk.Label(
-            info,
+            guide,
             text=(
-                "1) 사진 불러오기 → "
-                "2) OCR → "
-                "3) 표에서 오류/빈칸 수정 → "
-                "4) CSV 저장 → "
-                "5) CADian에서 MEASUREAUTO 실행"
+                "1) 실측사진 불러오기  →  "
+                "2) 사진 방향 확인/회전  →  "
+                "3) 숫자 자동인식  →  "
+                "4) 사진과 표 대조  →  "
+                "5) 오류/빈칸 수정  →  "
+                "6) CSV 저장  →  "
+                "7) CADian에서 MEASUREAUTO 실행"
             )
         ).pack(
             anchor="w"
         )
 
 
-        # ----------------------------------------------------
-        # 선택된 사진 표시
-        # ----------------------------------------------------
-
-        self.path_var = tk.StringVar(
-            value="사진: 선택 안 됨"
+        self.status_var = tk.StringVar(
+            value="실측사진을 불러오세요."
         )
 
 
         ttk.Label(
             self,
-            textvariable=self.path_var,
-            padding=(12, 0)
+            textvariable=self.status_var,
+            padding=(10, 4)
         ).pack(
-            anchor="w"
+            fill="x"
         )
 
 
         # ----------------------------------------------------
-        # 표
+        # 좌/우 분할
         # ----------------------------------------------------
 
-        frame = ttk.Frame(
+        self.paned = ttk.Panedwindow(
             self,
-            padding=10
+            orient="horizontal"
         )
 
-        frame.pack(
+        self.paned.pack(
+            fill="both",
+            expand=True,
+            padx=8,
+            pady=5
+        )
+
+
+        # ====================================================
+        # 왼쪽 : 실측사진
+        # ====================================================
+
+        left = ttk.LabelFrame(
+            self.paned,
+            text="실측자료 사진",
+            padding=5
+        )
+
+
+        self.paned.add(
+            left,
+            weight=3
+        )
+
+
+        self.image_canvas = tk.Canvas(
+            left,
+            background="#333333",
+            highlightthickness=0
+        )
+
+
+        self.image_canvas.pack(
+            fill="both",
+            expand=True
+        )
+
+
+        self.image_canvas.bind(
+            "<Configure>",
+            lambda event: self.show_preview()
+        )
+
+
+        # ====================================================
+        # 오른쪽 : OCR 결과
+        # ====================================================
+
+        right = ttk.LabelFrame(
+            self.paned,
+            text="자동 인식 실측값 - 반드시 검토",
+            padding=5
+        )
+
+
+        self.paned.add(
+            right,
+            weight=2
+        )
+
+
+        tree_frame = ttk.Frame(
+            right
+        )
+
+        tree_frame.pack(
             fill="both",
             expand=True
         )
 
 
         self.tree = ttk.Treeview(
-            frame,
+
+            tree_frame,
+
             columns=(
                 "no",
                 "value",
+                "confidence",
                 "status"
             ),
+
             show="headings",
+
             selectmode="extended"
+
         )
 
 
@@ -194,12 +317,15 @@ class App(tk.Tk):
             text="순서"
         )
 
-
         self.tree.heading(
             "value",
             text="실측값"
         )
 
+        self.tree.heading(
+            "confidence",
+            text="인식률"
+        )
 
         self.tree.heading(
             "status",
@@ -209,21 +335,25 @@ class App(tk.Tk):
 
         self.tree.column(
             "no",
-            width=100,
+            width=60,
             anchor="center"
         )
-
 
         self.tree.column(
             "value",
-            width=250,
+            width=120,
             anchor="center"
         )
 
+        self.tree.column(
+            "confidence",
+            width=80,
+            anchor="center"
+        )
 
         self.tree.column(
             "status",
-            width=300,
+            width=120,
             anchor="center"
         )
 
@@ -235,16 +365,14 @@ class App(tk.Tk):
         )
 
 
-        self.tree.bind(
-            "<Double-1>",
-            self.edit_cell
-        )
-
-
         scrollbar = ttk.Scrollbar(
-            frame,
+
+            tree_frame,
+
             orient="vertical",
+
             command=self.tree.yview
+
         )
 
 
@@ -259,77 +387,87 @@ class App(tk.Tk):
         )
 
 
+        self.tree.bind(
+            "<Double-1>",
+            self.edit_cell
+        )
+
+
         # ----------------------------------------------------
-        # 하단 안내
+        # 하단 설명
         # ----------------------------------------------------
 
-        ttk.Label(
+        bottom = ttk.LabelFrame(
             self,
+            text="검토 안내",
+            padding=7
+        )
+
+        bottom.pack(
+            fill="x",
+            padx=8,
+            pady=(0, 8)
+        )
+
+
+        ttk.Label(
+            bottom,
             text=(
-                "※ OCR은 보조 기능입니다. "
-                "CAD 적용 전 반드시 실측지와 숫자를 대조하세요. "
-                "실측값은 더블클릭해서 수정할 수 있습니다."
-            ),
-            padding=10
+                "OCR 결과는 자동 확정하지 않습니다. "
+                "손글씨와 인쇄 치수가 함께 있는 경우 잘못 인식될 수 있습니다. "
+                "실측값 셀을 더블클릭하면 직접 수정할 수 있습니다. "
+                "확실하지 않은 값은 '확인 필요'로 표시됩니다."
+            )
         ).pack(
-            fill="x"
+            anchor="w"
         )
 
 
     # ========================================================
-    # 오류 로그 저장
+    # 오류 로그
     # ========================================================
 
-    def save_error_log(self, error_text):
+    def save_error_log(self, text):
 
-        possible_paths = []
+        paths = []
 
 
-        # 바탕화면
         try:
 
-            desktop = Path.home() / "Desktop"
-
-            possible_paths.append(
-                desktop / "ocr_error.txt"
+            paths.append(
+                Path.home() / "Desktop" / "ocr_error.txt"
             )
 
         except Exception:
             pass
 
 
-        # EXE 실행 폴더
         try:
 
-            if getattr(
-                sys,
-                "frozen",
-                False
-            ):
+            if getattr(sys, "frozen", False):
 
-                exe_folder = Path(
+                base = Path(
                     sys.executable
                 ).parent
 
             else:
 
-                exe_folder = Path(
+                base = Path(
                     __file__
                 ).resolve().parent
 
 
-            possible_paths.append(
-                exe_folder / "ocr_error.txt"
+            paths.append(
+                base / "ocr_error.txt"
             )
 
         except Exception:
             pass
 
 
-        # 사용자 홈
         try:
 
-            possible_paths.append(
+            paths.append(
                 Path.home() / "ocr_error.txt"
             )
 
@@ -337,38 +475,30 @@ class App(tk.Tk):
             pass
 
 
-        for path in possible_paths:
+        for path in paths:
 
             try:
-
-                path.parent.mkdir(
-                    parents=True,
-                    exist_ok=True
-                )
-
 
                 with open(
                     path,
                     "w",
                     encoding="utf-8"
-                ) as file:
+                ) as f:
 
-                    file.write(
-                        error_text
-                    )
+                    f.write(text)
 
 
                 return str(path)
 
             except Exception:
-                continue
+                pass
 
 
         return None
 
 
     # ========================================================
-    # 사진 선택
+    # 이미지 로드
     # ========================================================
 
     def load_image(self):
@@ -380,12 +510,12 @@ class App(tk.Tk):
             filetypes=[
 
                 (
-                    "Image files",
-                    "*.png *.jpg *.jpeg *.bmp *.webp"
+                    "사진 파일",
+                    "*.jpg *.jpeg *.png *.bmp *.webp"
                 ),
 
                 (
-                    "All files",
+                    "모든 파일",
                     "*.*"
                 )
 
@@ -398,25 +528,86 @@ class App(tk.Tk):
             return
 
 
-        self.image_path = path
+        try:
+
+            # ------------------------------------------------
+            # 핵심 수정
+            #
+            # cv2.imread(path)를 바로 쓰지 않는다.
+            # 한글 경로 문제까지 피하기 위해
+            # np.fromfile + cv2.imdecode 사용
+            # ------------------------------------------------
+
+            file_data = np.fromfile(
+                path,
+                dtype=np.uint8
+            )
 
 
-        self.path_var.set(
-            f"사진: {path}"
-        )
+            image = cv2.imdecode(
+                file_data,
+                cv2.IMREAD_COLOR
+            )
+
+
+            if image is None:
+
+                raise RuntimeError(
+                    "사진 파일을 읽지 못했습니다."
+                )
+
+
+            self.image_path = path
+
+            self.original_cv = image.copy()
+
+            self.working_cv = image.copy()
+
+
+            self.status_var.set(
+                f"사진: {path}"
+            )
+
+
+            self.show_preview()
+
+
+        except Exception as e:
+
+            error_text = traceback.format_exc()
+
+            error_file = self.save_error_log(
+                error_text
+            )
+
+
+            message = (
+                "사진을 불러오는 중 오류가 발생했습니다.\n\n"
+                + str(e)
+            )
+
+
+            if error_file:
+
+                message += (
+                    "\n\n상세 오류:\n"
+                    + error_file
+                )
+
+
+            messagebox.showerror(
+                "사진 오류",
+                message
+            )
 
 
     # ========================================================
-    # OCR 실행
+    # 사진 회전
     # ========================================================
 
-    def run_ocr(self):
+    def rotate_image(self, angle):
 
-        # ----------------------------------------------------
-        # 사진 확인
-        # ----------------------------------------------------
-
-        if not self.image_path:
+        if self.working_cv is None:
 
             messagebox.showwarning(
                 "확인",
@@ -426,14 +617,249 @@ class App(tk.Tk):
             return
 
 
+        if angle == 90:
+
+            self.working_cv = cv2.rotate(
+                self.working_cv,
+                cv2.ROTATE_90_COUNTERCLOCKWISE
+            )
+
+
+        elif angle == -90:
+
+            self.working_cv = cv2.rotate(
+                self.working_cv,
+                cv2.ROTATE_90_CLOCKWISE
+            )
+
+
+        elif angle == 180:
+
+            self.working_cv = cv2.rotate(
+                self.working_cv,
+                cv2.ROTATE_180
+            )
+
+
+        self.show_preview()
+
+
+    # ========================================================
+    # 사진 미리보기
+    # ========================================================
+
+    def show_preview(self):
+
+        if self.working_cv is None:
+            return
+
+
+        try:
+
+            canvas_width = self.image_canvas.winfo_width()
+
+            canvas_height = self.image_canvas.winfo_height()
+
+
+            if canvas_width < 50:
+                return
+
+
+            if canvas_height < 50:
+                return
+
+
+            rgb = cv2.cvtColor(
+                self.working_cv,
+                cv2.COLOR_BGR2RGB
+            )
+
+
+            h, w = rgb.shape[:2]
+
+
+            scale = min(
+
+                canvas_width / w,
+
+                canvas_height / h
+
+            )
+
+
+            scale = min(
+                scale,
+                1.0
+            )
+
+
+            new_width = max(
+                1,
+                int(w * scale)
+            )
+
+
+            new_height = max(
+                1,
+                int(h * scale)
+            )
+
+
+            resized = cv2.resize(
+
+                rgb,
+
+                (
+                    new_width,
+                    new_height
+                ),
+
+                interpolation=cv2.INTER_AREA
+
+            )
+
+
+            pil_image = Image.fromarray(
+                resized
+            )
+
+
+            self.preview_photo = ImageTk.PhotoImage(
+                pil_image
+            )
+
+
+            self.image_canvas.delete(
+                "all"
+            )
+
+
+            self.image_canvas.create_image(
+
+                canvas_width // 2,
+
+                canvas_height // 2,
+
+                image=self.preview_photo,
+
+                anchor="center"
+
+            )
+
+
+        except Exception:
+            pass
+
+
+    # ========================================================
+    # OCR Reader
+    # ========================================================
+
+    def get_reader(self):
+
+        if self.reader is not None:
+
+            return self.reader
+
+
+        self.status_var.set(
+            "OCR 엔진을 준비하고 있습니다..."
+        )
+
+
+        self.update_idletasks()
+
+
+        self.reader = easyocr.Reader(
+
+            ["en"],
+
+            gpu=False,
+
+            verbose=False
+
+        )
+
+
+        return self.reader
+
+
+    # ========================================================
+    # OCR용 이미지 전처리
+    # ========================================================
+
+    def prepare_ocr_image(self):
+
+        if self.working_cv is None:
+
+            raise RuntimeError(
+                "사진이 없습니다."
+            )
+
+
+        image = self.working_cv.copy()
+
+
+        # 너무 큰 사진은 OCR 처리 속도 때문에 축소
+        h, w = image.shape[:2]
+
+
+        max_side = max(
+            h,
+            w
+        )
+
+
+        if max_side > 3000:
+
+            scale = 3000.0 / max_side
+
+
+            image = cv2.resize(
+
+                image,
+
+                None,
+
+                fx=scale,
+
+                fy=scale,
+
+                interpolation=cv2.INTER_AREA
+
+            )
+
+
         # ----------------------------------------------------
-        # EasyOCR import 확인
+        # EasyOCR에는 파일명이 아니라
+        # 정상적인 numpy ndarray를 전달한다.
         # ----------------------------------------------------
+
+        return np.ascontiguousarray(
+            image
+        )
+
+
+    # ========================================================
+    # OCR
+    # ========================================================
+
+    def run_ocr(self):
+
+        if self.working_cv is None:
+
+            messagebox.showwarning(
+                "확인",
+                "먼저 실측사진을 불러오세요."
+            )
+
+            return
+
 
         if not OCR_AVAILABLE:
 
-            error_file = self.save_error_log(
-                OCR_ERROR
+            path = self.save_error_log(
+                OCR_IMPORT_ERROR
             )
 
 
@@ -442,16 +868,16 @@ class App(tk.Tk):
             )
 
 
-            if error_file:
+            if path:
 
                 message += (
-                    "\n\n오류 기록을 저장했습니다.\n"
-                    + error_file
+                    "\n\n상세 오류:\n"
+                    + path
                 )
 
 
             messagebox.showerror(
-                "OCR 모듈 오류",
+                "OCR 오류",
                 message
             )
 
@@ -460,78 +886,67 @@ class App(tk.Tk):
 
         try:
 
-            # ------------------------------------------------
-            # OCR Reader 초기화
-            # ------------------------------------------------
-
-            if self.reader is None:
-
-                self.title(
-                    "교량 실측 CAD 자동작성 - OCR 준비 중..."
-                )
-
-
-                self.update_idletasks()
-
-
-                self.reader = easyocr.Reader(
-                    ["en"],
-                    gpu=False,
-                    verbose=False
-                )
-
-
-            # ------------------------------------------------
-            # OCR 시작
-            # ------------------------------------------------
-
             self.title(
                 "교량 실측 CAD 자동작성 - 숫자 인식 중..."
+            )
+
+
+            self.status_var.set(
+                "사진에서 숫자를 찾고 있습니다..."
             )
 
 
             self.update_idletasks()
 
 
-            result = self.reader.readtext(
+            reader = self.get_reader()
 
-                self.image_path,
+
+            image = self.prepare_ocr_image()
+
+
+            # ------------------------------------------------
+            # 중요:
+            # 파일 경로가 아니라 OpenCV ndarray 전달
+            # ------------------------------------------------
+
+            results = reader.readtext(
+
+                image,
 
                 detail=1,
 
-                paragraph=False
+                paragraph=False,
+
+                decoder="greedy"
 
             )
 
 
-            # ------------------------------------------------
-            # OCR 결과 확인
-            # ------------------------------------------------
-
-            candidates = []
+            found = []
 
 
-            for item in result:
+            # =================================================
+            # OCR 결과에서 숫자 + 위치 추출
+            # =================================================
 
-                # EasyOCR 결과는 보통
-                # [좌표, 문자, 신뢰도]
-                # 형태이다.
+            for result in results:
 
-                if len(item) < 3:
+                if len(result) < 3:
                     continue
 
 
-                box = item[0]
+                box = result[0]
 
-                text = str(
-                    item[1]
-                )
+                raw_text = str(
+                    result[1]
+                ).strip()
 
 
                 try:
 
                     confidence = float(
-                        item[2]
+                        result[2]
                     )
 
                 except Exception:
@@ -539,39 +954,150 @@ class App(tk.Tk):
                     confidence = 0.0
 
 
-                # 쉼표와 공백 제거
-                cleaned = (
-                    text
-                    .replace(",", "")
+                # ------------------------------------------------
+                # OCR 흔한 문자 오인식 일부 보정
+                #
+                # 단, 확정값으로 간주하지 않고
+                # 상태에서 사용자 확인을 요구한다.
+                # ------------------------------------------------
+
+                normalized = (
+                    raw_text
                     .replace(" ", "")
+                    .replace(",", "")
                 )
 
 
-                # ------------------------------------------------
-                # 3~5자리 숫자 후보
-                # ------------------------------------------------
+                corrected = normalized
 
-                numbers = re.findall(
-                    r"(?<!\d)\d{3,5}(?!\d)",
-                    cleaned
+
+                corrected = corrected.replace(
+                    "O",
+                    "0"
+                )
+
+                corrected = corrected.replace(
+                    "o",
+                    "0"
                 )
 
 
-                for number in numbers:
+                # 숫자만 추출
+                number_matches = re.findall(
 
-                    candidates.append(
+                    r"\d{3,5}",
 
-                        (
-                            int(number),
-                            confidence
+                    corrected
+
+                )
+
+
+                if not number_matches:
+                    continue
+
+
+                # 박스 중심좌표
+                try:
+
+                    xs = [
+                        float(p[0])
+                        for p in box
+                    ]
+
+
+                    ys = [
+                        float(p[1])
+                        for p in box
+                    ]
+
+
+                    center_x = sum(xs) / len(xs)
+
+                    center_y = sum(ys) / len(ys)
+
+
+                except Exception:
+
+                    center_x = 0
+
+                    center_y = 0
+
+
+                for number_text in number_matches:
+
+                    try:
+
+                        value = int(
+                            number_text
                         )
 
-                    )
+                    except Exception:
+
+                        continue
 
 
-            # ------------------------------------------------
-            # 기존 표 초기화
-            # ------------------------------------------------
+                    # --------------------------------------------
+                    # 교량 실측값 후보 범위
+                    #
+                    # 너무 작은 도면 숫자 등을 조금 걸러내기 위한
+                    # 1차 필터.
+                    #
+                    # 최종 확정은 사용자가 한다.
+                    # --------------------------------------------
+
+                    if value < 500:
+
+                        continue
+
+
+                    if value > 99999:
+
+                        continue
+
+
+                    found.append({
+
+                        "value": value,
+
+                        "confidence": confidence,
+
+                        "x": center_x,
+
+                        "y": center_y,
+
+                        "raw": raw_text
+
+                    })
+
+
+            # =================================================
+            # 위치순 정렬
+            # =================================================
+
+            # 현재 버전에서는
+            # 위 → 아래, 같은 높이면 왼쪽 → 오른쪽
+
+            found.sort(
+
+                key=lambda item: (
+
+                    round(
+                        item["y"] / 40
+                    ),
+
+                    item["x"]
+
+                )
+
+            )
+
+
+            self.ocr_items = found
+
+
+            # =================================================
+            # 표 초기화
+            # =================================================
 
             children = self.tree.get_children()
 
@@ -583,52 +1109,79 @@ class App(tk.Tk):
                 )
 
 
-            # ------------------------------------------------
-            # 숫자를 못 찾았을 때
-            # ------------------------------------------------
+            # =================================================
+            # 결과 없음
+            # =================================================
 
-            if not candidates:
+            if not found:
 
                 self.add_row()
 
 
+                self.status_var.set(
+                    "자동 인식된 실측값이 없습니다."
+                )
+
+
                 messagebox.showinfo(
+
                     "OCR 결과",
+
                     (
-                        "자동으로 확인할 수 있는 실측 숫자를 "
-                        "찾지 못했습니다.\n\n"
-                        "필요한 값을 직접 입력해주세요."
+                        "자동으로 확인된 숫자가 없습니다.\n\n"
+                        "사진 방향을 바꿔 다시 OCR하거나 "
+                        "실측값을 직접 입력해주세요."
                     )
+
                 )
 
                 return
 
 
-            # ------------------------------------------------
-            # 표에 결과 표시
-            # ------------------------------------------------
+            # =================================================
+            # 결과 표 입력
+            # =================================================
 
-            for index, data in enumerate(
-                candidates,
+            for index, item in enumerate(
+                found,
                 1
             ):
 
-                value = data[0]
+                confidence = item[
+                    "confidence"
+                ]
 
-                confidence = data[1]
 
+                # --------------------------------------------
+                # 상태 판단
+                # --------------------------------------------
 
-                if confidence >= 0.80:
+                if confidence >= 0.85:
 
                     status = "자동 인식"
 
 
-                elif confidence >= 0.60:
+                elif confidence >= 0.65:
 
                     status = "확인 권장"
 
 
                 else:
+
+                    status = "확인 필요"
+
+
+                # OCR 원문에 문자 보정이 있었으면
+                # 반드시 확인하도록 한다.
+
+                raw_compact = (
+                    item["raw"]
+                    .replace(" ", "")
+                    .replace(",", "")
+                )
+
+
+                if not raw_compact.isdigit():
 
                     status = "확인 필요"
 
@@ -643,7 +1196,9 @@ class App(tk.Tk):
 
                         index,
 
-                        value,
+                        item["value"],
+
+                        f"{confidence * 100:.0f}%",
 
                         status
 
@@ -652,51 +1207,53 @@ class App(tk.Tk):
                 )
 
 
+            self.status_var.set(
+
+                f"OCR 완료 - 숫자 후보 {len(found)}개 / 반드시 실측지와 대조하세요."
+
+            )
+
+
             messagebox.showinfo(
 
                 "OCR 완료",
 
                 (
-                    f"{len(candidates)}개의 "
-                    "숫자 후보를 찾았습니다.\n\n"
-                    "실측자료와 비교해서 값을 확인해주세요."
+                    f"숫자 후보 {len(found)}개를 찾았습니다.\n\n"
+                    "현재 단계에서는 인쇄 치수도 함께 인식될 수 있습니다.\n"
+                    "오른쪽 표와 왼쪽 실측사진을 비교해서 확인해주세요."
                 )
 
             )
 
-
-        # ----------------------------------------------------
-        # 오류 발생
-        # ----------------------------------------------------
 
         except Exception as e:
 
             error_text = traceback.format_exc()
 
 
-            error_file = self.save_error_log(
+            path = self.save_error_log(
                 error_text
             )
 
 
             message = (
+
                 "OCR 처리 중 오류가 발생했습니다.\n\n"
+
                 + str(e)
+
             )
 
 
-            if error_file:
+            if path:
 
                 message += (
-                    "\n\n상세 오류 기록을 저장했습니다:\n"
-                    + error_file
-                )
 
+                    "\n\n상세 오류 기록:\n"
 
-            else:
+                    + path
 
-                message += (
-                    "\n\n오류 로그 파일을 저장하지 못했습니다."
                 )
 
 
@@ -706,14 +1263,10 @@ class App(tk.Tk):
             )
 
 
-        # ----------------------------------------------------
-        # 프로그램 제목 복구
-        # ----------------------------------------------------
-
         finally:
 
             self.title(
-                "교량 실측 CAD 자동작성 - 테스트"
+                "교량 실측 CAD 자동작성"
             )
 
 
@@ -743,6 +1296,8 @@ class App(tk.Tk):
 
                 "",
 
+                "-",
+
                 "직접 입력"
 
             )
@@ -751,10 +1306,10 @@ class App(tk.Tk):
 
 
     # ========================================================
-    # 선택 행 삭제
+    # 행 삭제
     # ========================================================
 
-    def delete_row(self):
+    def delete_selected_rows(self):
 
         selection = self.tree.selection()
 
@@ -766,35 +1321,29 @@ class App(tk.Tk):
             )
 
 
-        self.renumber()
+        self.renumber_rows()
 
 
     # ========================================================
-    # 순서 다시 지정
+    # 번호 재정렬
     # ========================================================
 
-    def renumber(self):
-
-        items = self.tree.get_children()
-
+    def renumber_rows(self):
 
         for index, item in enumerate(
-            items,
+            self.tree.get_children(),
             1
         ):
 
             values = list(
-
                 self.tree.item(
                     item,
                     "values"
                 )
-
             )
 
 
-            if len(values) < 3:
-
+            if len(values) < 4:
                 continue
 
 
@@ -808,7 +1357,7 @@ class App(tk.Tk):
 
 
     # ========================================================
-    # 실측값 수정
+    # 셀 수정
     # ========================================================
 
     def edit_cell(self, event):
@@ -838,7 +1387,7 @@ class App(tk.Tk):
             return
 
 
-        # 실측값 열만 수정 가능
+        # 실측값만 수정
         if column != "#2":
             return
 
@@ -895,14 +1444,14 @@ class App(tk.Tk):
         )
 
 
-        saved = {
-            "done": False
+        done = {
+            "saved": False
         }
 
 
-        def save_value(event=None):
+        def save(event=None):
 
-            if saved["done"]:
+            if done["saved"]:
                 return
 
 
@@ -917,8 +1466,11 @@ class App(tk.Tk):
                 ):
 
                     messagebox.showwarning(
+
                         "입력 오류",
+
                         "실측값은 숫자로 입력하세요."
+
                     )
 
                     entry.focus_set()
@@ -926,7 +1478,7 @@ class App(tk.Tk):
                     return
 
 
-            saved["done"] = True
+            done["saved"] = True
 
 
             self.tree.set(
@@ -938,8 +1490,15 @@ class App(tk.Tk):
 
             self.tree.set(
                 row,
+                "confidence",
+                "-"
+            )
+
+
+            self.tree.set(
+                row,
                 "status",
-                "검토/수정"
+                "사용자 확인"
             )
 
 
@@ -948,13 +1507,13 @@ class App(tk.Tk):
 
         entry.bind(
             "<Return>",
-            save_value
+            save
         )
 
 
         entry.bind(
             "<FocusOut>",
-            save_value
+            save
         )
 
 
@@ -967,37 +1526,32 @@ class App(tk.Tk):
         rows = []
 
 
-        # ----------------------------------------------------
-        # 표 읽기
-        # ----------------------------------------------------
-
         for item in self.tree.get_children():
 
             value = str(
-
                 self.tree.set(
                     item,
                     "value"
                 )
-
             ).strip()
 
 
-            # 빈칸
             if not value:
 
                 messagebox.showwarning(
-                    "빈칸",
+
+                    "빈칸 확인",
+
                     (
                         "빈 실측값이 있습니다.\n\n"
-                        "모든 값을 확인한 후 저장해주세요."
+                        "사진과 대조하여 모든 값을 확인한 후 저장해주세요."
                     )
+
                 )
 
                 return
 
 
-            # 숫자 확인
             try:
 
                 number = float(
@@ -1013,8 +1567,11 @@ class App(tk.Tk):
             except Exception:
 
                 messagebox.showwarning(
-                    "입력 오류",
-                    f"잘못된 실측값이 있습니다: {value}"
+
+                    "실측값 오류",
+
+                    f"숫자가 아닌 실측값이 있습니다: {value}"
+
                 )
 
                 return
@@ -1025,23 +1582,15 @@ class App(tk.Tk):
             )
 
 
-        # ----------------------------------------------------
-        # 최소 개수 확인
-        # ----------------------------------------------------
-
-        if len(rows) < 2:
+        if len(rows) < 1:
 
             messagebox.showwarning(
                 "확인",
-                "실측값을 2개 이상 입력하세요."
+                "저장할 실측값이 없습니다."
             )
 
             return
 
-
-        # ----------------------------------------------------
-        # 저장 위치
-        # ----------------------------------------------------
 
         path = filedialog.asksaveasfilename(
 
@@ -1054,7 +1603,7 @@ class App(tk.Tk):
             filetypes=[
 
                 (
-                    "CSV",
+                    "CSV 파일",
                     "*.csv"
                 )
 
@@ -1066,10 +1615,6 @@ class App(tk.Tk):
         if not path:
             return
 
-
-        # ----------------------------------------------------
-        # CSV 작성
-        # ----------------------------------------------------
 
         try:
 
@@ -1100,11 +1645,8 @@ class App(tk.Tk):
                     writer.writerow(
 
                         [
-
                             index,
-
                             value
-
                         ]
 
                     )
@@ -1113,23 +1655,22 @@ class App(tk.Tk):
         except Exception as e:
 
             messagebox.showerror(
+
                 "CSV 저장 오류",
+
                 str(e)
+
             )
 
             return
 
-
-        # ----------------------------------------------------
-        # 완료
-        # ----------------------------------------------------
 
         messagebox.showinfo(
 
             "저장 완료",
 
             (
-                "실측값 CSV 저장이 완료되었습니다.\n\n"
+                "CADian용 실측값 CSV를 저장했습니다.\n\n"
                 f"{path}\n\n"
                 "CADian에서 MEASUREAUTO를 실행하세요."
             )
@@ -1138,11 +1679,11 @@ class App(tk.Tk):
 
 
 # ============================================================
-# 프로그램 시작
+# 시작
 # ============================================================
 
 if __name__ == "__main__":
 
-    app = App()
+    app = BridgeMeasureApp()
 
     app.mainloop()
